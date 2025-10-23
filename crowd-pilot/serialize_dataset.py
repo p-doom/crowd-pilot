@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, cast, Dict
+import random
 
 import pandas as pd  # type: ignore
 from datasets import Dataset, load_dataset  # type: ignore
@@ -22,10 +23,11 @@ class SerializeConfig:
     shard_size: int
     target_chars: int
     overlap_chars: int
-    min_doc_chars: int
+    min_session_chars: int
     max_docs: Optional[int]
     long_pause_threshold_ms: int
     csv_root: Optional[str]
+    val_ratio: float
 
 
 def _clean_text(text: str) -> str:
@@ -182,16 +184,13 @@ def _discover_local_sessions(root: Path) -> List[Path]:
     return paths
 
 
-def _chunk_text(text: str, target_chars: int, overlap_chars: int, min_doc_chars: int) -> List[str]:
-    """Split a long text into overlapping chunks near target length.
-
-    Preserves word boundaries when possible. Skips chunks smaller than min_doc_chars.
-    """
+def _chunk_text(text: str, target_chars: int, overlap_chars: int) -> List[str]:
+    """Split a long text into overlapping chunks near target length."""
     if target_chars <= 0:
         return [text]
     n = len(text)
     if n <= target_chars:
-        return [text] if n >= min_doc_chars else []
+        return [text]
 
     chunks: List[str] = []
     start = 0
@@ -200,20 +199,11 @@ def _chunk_text(text: str, target_chars: int, overlap_chars: int, min_doc_chars:
     while start < n:
         end_target = min(start + target_chars, n)
         if end_target < n:
-            # try to break on a newline or space before the target
-            break_pos = text.rfind("\n", start, end_target)
-            if break_pos == -1:
-                break_pos = text.rfind(" ", start, end_target)
-            if break_pos == -1 or break_pos <= start + min_doc_chars:
-                break_pos = end_target
-            end = break_pos
+            end = end_target
         else:
             end = n
         chunk = text[start:end].strip()
-        if len(chunk) >= min_doc_chars:
-            chunks.append(chunk)
-        else:
-            print(f"Skipping chunk {chunk} because it's too small")
+        chunks.append(chunk)
         if end == n:
             break
         # advance with overlap
@@ -230,8 +220,8 @@ def to_parquet(
 
     required_cols = ["Sequence", "Time", "File", "RangeOffset", "RangeLength", "Text", "Language", "Type"]
 
-    # Build a list of per-session DataFrames
-    session_dataframes: List[pd.DataFrame] = []
+    # Build a list of per-session DataFrames with file paths
+    session_dataframes: List[Tuple[pd.DataFrame, str]] = []
     root = Path(cast(str, cfg.csv_root)).expanduser().resolve()
     csv_files = _discover_local_sessions(root)
     assert csv_files, f"No CSV files found under {root}"
@@ -239,45 +229,59 @@ def to_parquet(
         df = pd.read_csv(csv_file)
         missing_local = [c for c in required_cols if c not in df.columns]
         assert not missing_local, f"Missing required CSV columns in {csv_file}: {missing_local}"
-        session_dataframes.append(df)
+        session_dataframes.append((df, str(csv_file)))
 
-    rows_out = 0
-    shard_idx = 0
-    buffer: List[str] = []
+    random.seed(42)
+    session_dataframes = [(df, path) for df, path in session_dataframes]
+    random.shuffle(session_dataframes)
+    
+    total_sessions = len(session_dataframes)
+    val_count = int(total_sessions * cfg.val_ratio)
+    train_count = total_sessions - val_count
+
+    train_rows = 0
+    val_rows = 0
+    train_shard_idx = 0
+    val_shard_idx = 0
     docs_written = 0
 
-    def flush_buffer(idx: int):
-        nonlocal buffer, rows_out
-        if not buffer:
-            return
-        df_out = pd.DataFrame({"text": buffer})
-        out_path = Path(cfg.output_dir) / f"shard_{idx:05d}.parquet"
-        table = df_out
-        table.to_parquet(out_path, index=False)
-        rows_out += len(df_out)
-        buffer = []
+    def write_shard(chunks: List[str], split: str, shard_idx: int) -> int:
+        if not chunks:
+            return 0
+        df_out = pd.DataFrame({"text": chunks})
+        out_path = Path(cfg.output_dir) / f"{split}_{shard_idx:05d}.parquet"
+        df_out.to_parquet(out_path, index=False)
+        return len(df_out)
 
-    for session_df in session_dataframes:
+    for i, (session_df, session_path) in enumerate(session_dataframes):
         session_df = pd.DataFrame(session_df.copy())
         transcript = _session_to_transcript(
             session_df,
             long_pause_threshold_ms=cfg.long_pause_threshold_ms,
         )
-        chunks = _chunk_text(transcript, cfg.target_chars, cfg.overlap_chars, cfg.min_doc_chars)
+        # Skip sessions that are too short
+        if len(transcript.strip()) < cfg.min_session_chars:
+            print(f"Skipping session {session_path} because it's too short ({len(transcript.strip())} chars)")
+            continue
+        chunks = _chunk_text(transcript, cfg.target_chars, cfg.overlap_chars)
         if not chunks:
             continue
-        buffer.extend(chunks)
         docs_written += len(chunks)
-        if len(buffer) >= cfg.shard_size:
-            flush_buffer(shard_idx)
-            shard_idx += 1
+        
+        # Write chunks to appropriate split based on position
+        if i < train_count:
+            rows_written = write_shard(chunks, "train", train_shard_idx)
+            train_rows += rows_written
+            train_shard_idx += 1
+        else:
+            rows_written = write_shard(chunks, "val", val_shard_idx)
+            val_rows += rows_written
+            val_shard_idx += 1
+            
         if cfg.max_docs and docs_written >= cfg.max_docs:
             break
 
-    if buffer:
-        flush_buffer(shard_idx)
-
-    print(f"Wrote {rows_out} documents to {cfg.output_dir}")
+    print(f"Wrote {train_rows} train and {val_rows} val documents to {cfg.output_dir}")
 
 
 def parse_args() -> SerializeConfig:
@@ -288,19 +292,21 @@ def parse_args() -> SerializeConfig:
     # FIXME(f.srambical): It is awkward that the target number is in character-space instead of in token-space.
     p.add_argument("--target_chars", type=int, default=8192, help="Target characters per document chunk. This should be ~3-4x the max token length of the model you are using.")
     p.add_argument("--overlap_chars", type=int, default=128, help="Character overlap between chunks")
-    p.add_argument("--min_doc_chars", type=int, default=1024, help="Minimum characters to keep a chunk")
+    p.add_argument("--min_session_chars", type=int, default=1024, help="Minimum characters to keep a session")
     p.add_argument("--max_docs", type=int, default=None, help="Stop after writing this many unique docs")
     p.add_argument("--long_pause_threshold_ms", type=int, default=120000, help="Threshold (ms) to annotate long pauses and emit a keyframe")
+    p.add_argument("--val_ratio", type=float, default=0.10, help="Fraction of sessions to route to validation [0,1)")
     args = p.parse_args()
     return SerializeConfig(
         output_dir=args.output_dir,
         shard_size=args.shard_size,
         target_chars=args.target_chars,
         overlap_chars=args.overlap_chars,
-        min_doc_chars=args.min_doc_chars,
+        min_session_chars=args.min_session_chars,
         max_docs=args.max_docs,
         long_pause_threshold_ms=args.long_pause_threshold_ms,
         csv_root=(args.csv_root if args.csv_root else None),
+        val_ratio=args.val_ratio,
     )
 
 
