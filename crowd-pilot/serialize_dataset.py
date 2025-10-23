@@ -110,6 +110,13 @@ def _session_to_transcript(
                 # Terminal focus event
                 parts.append(f"<act focus target=\"terminal\" />")
 
+            case "git_branch_checkout":
+                # Git branch checkout event
+                branch_info = row["Text"]
+                branch_str = str(branch_info).replace("\\n", "\n").replace("\\r", "\r")
+                parts.append(f"<act git_branch_checkout />")
+                parts.append(f"// git: {_clean_text(branch_str)}")
+
             case "selection_command" | "selection_mouse" | "selection_keyboard":
                 # Handle cursor movement
                 offset = row["RangeOffset"]
