@@ -21,6 +21,7 @@ class SerializeConfig:
     output_dir: str
     shard_size: int
     target_chars: int
+    overlap_chars: int
     min_doc_chars: int
     max_docs: Optional[int]
     long_pause_threshold_ms: int
@@ -47,12 +48,11 @@ def _apply_change(content: str, offset: int, length: int, new_text: str) -> str:
     return base[:offset] + text + base[offset + length:]
 
 
-
-
-def _session_to_parts(
+def _session_to_transcript(
     df: pd.DataFrame,
     long_pause_threshold_ms: int,
-) -> List[str]:
+) -> str:
+
     file_states: Dict[str, str] = {}
     terminal_state: str = ""
     per_file_event_counts: Dict[str, int] = {}
@@ -159,49 +159,12 @@ def _session_to_parts(
             case _:
                 raise ValueError(f"Unknown event type: {event_type}")
 
-    return parts
+    return "\n".join(parts).strip()
 
-
-def _chunk_parts(parts: List[str], target_chars: int, min_doc_chars: int) -> List[str]:
-    """Chunk by aggregating whole parts without splitting parts.
-
-    Each chunk is a concatenation of complete parts whose total length is as
-    close as possible to target_chars without exceeding it (except when a
-    single part alone exceeds target_chars, in which case it forms its own
-    chunk). No overlap is introduced between consecutive chunks.
-    """
-    if target_chars <= 0:
-        joined = "\n".join(parts).strip()
-        return [joined] if len(joined) >= min_doc_chars else []
-
-    chunks_out: List[str] = []
-    current: List[str] = []
-    current_len = 0
-
-    def flush_current():
-        nonlocal current, current_len
-        if not current:
-            return
-        joined = "\n".join(current).strip()
-        if len(joined) >= min_doc_chars:
-            chunks_out.append(joined)
-        current = []
-        current_len = 0
-
-    for p in parts:
-        p_len = len(p) + 1  # account for newline joining
-        if current_len + p_len <= target_chars or not current:
-            current.append(p)
-            current_len += p_len
-        else:
-            flush_current()
-            # If the part itself exceeds target, still include it to preserve atomicity
-            current.append(p)
-            current_len = p_len
-    flush_current()
-    return chunks_out
 
  
+
+
 def load_hf_csv(hf_path: str, split: str) -> Dataset:
     loaded = load_dataset(hf_path, split=split)
 
@@ -217,6 +180,47 @@ def _discover_local_sessions(root: Path) -> List[Path]:
             paths.append(p)
     paths.sort()
     return paths
+
+
+def _chunk_text(text: str, target_chars: int, overlap_chars: int, min_doc_chars: int) -> List[str]:
+    """Split a long text into overlapping chunks near target length.
+
+    Preserves word boundaries when possible. Skips chunks smaller than min_doc_chars.
+    """
+    if target_chars <= 0:
+        return [text]
+    n = len(text)
+    if n <= target_chars:
+        return [text] if n >= min_doc_chars else []
+
+    chunks: List[str] = []
+    start = 0
+    # Ensure sane overlap
+    overlap = max(0, min(overlap_chars, target_chars // 2))
+    while start < n:
+        end_target = min(start + target_chars, n)
+        if end_target < n:
+            # try to break on a newline or space before the target
+            break_pos = text.rfind("\n", start, end_target)
+            if break_pos == -1:
+                break_pos = text.rfind(" ", start, end_target)
+            if break_pos == -1 or break_pos <= start + min_doc_chars:
+                break_pos = end_target
+            end = break_pos
+        else:
+            end = n
+        chunk = text[start:end].strip()
+        if len(chunk) >= min_doc_chars:
+            chunks.append(chunk)
+        else:
+            print(f"Skipping chunk {chunk} because it's too small")
+        if end == n:
+            break
+        # advance with overlap
+        start = max(0, end - overlap)
+        if start >= n:
+            break
+    return chunks
 
 
 def to_parquet(
@@ -255,11 +259,11 @@ def to_parquet(
 
     for session_df in session_dataframes:
         session_df = pd.DataFrame(session_df.copy())
-        parts = _session_to_parts(
+        transcript = _session_to_transcript(
             session_df,
             long_pause_threshold_ms=cfg.long_pause_threshold_ms,
         )
-        chunks = _chunk_parts(parts, cfg.target_chars, cfg.min_doc_chars)
+        chunks = _chunk_text(transcript, cfg.target_chars, cfg.overlap_chars, cfg.min_doc_chars)
         if not chunks:
             continue
         buffer.extend(chunks)
@@ -283,6 +287,7 @@ def parse_args() -> SerializeConfig:
     p.add_argument("--shard_size", type=int, default=20000, help="Rows per Parquet shard")
     # FIXME(f.srambical): It is awkward that the target number is in character-space instead of in token-space.
     p.add_argument("--target_chars", type=int, default=8192, help="Target characters per document chunk. This should be ~3-4x the max token length of the model you are using.")
+    p.add_argument("--overlap_chars", type=int, default=128, help="Character overlap between chunks")
     p.add_argument("--min_doc_chars", type=int, default=1024, help="Minimum characters to keep a chunk")
     p.add_argument("--max_docs", type=int, default=None, help="Stop after writing this many unique docs")
     p.add_argument("--long_pause_threshold_ms", type=int, default=120000, help="Threshold (ms) to annotate long pauses and emit a keyframe")
@@ -291,6 +296,7 @@ def parse_args() -> SerializeConfig:
         output_dir=args.output_dir,
         shard_size=args.shard_size,
         target_chars=args.target_chars,
+        overlap_chars=args.overlap_chars,
         min_doc_chars=args.min_doc_chars,
         max_docs=args.max_docs,
         long_pause_threshold_ms=args.long_pause_threshold_ms,
