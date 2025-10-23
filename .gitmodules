@@ -1,0 +1,3 @@
+[submodule "maxtext"]
+	path = maxtext
+	url = https://github.com/AI-Hypercomputer/maxtext
