@@ -18,15 +18,13 @@ from datasets import Dataset, load_dataset  # type: ignore
 
 @dataclass
 class SerializeConfig:
-    hf_path: str
-    split: str
     output_dir: str
     shard_size: int
     target_chars: int
-    overlap_chars: int
     min_doc_chars: int
     max_docs: Optional[int]
     long_pause_threshold_ms: int
+    csv_root: Optional[str]
 
 
 def _clean_text(text: str) -> str:
@@ -49,11 +47,12 @@ def _apply_change(content: str, offset: int, length: int, new_text: str) -> str:
     return base[:offset] + text + base[offset + length:]
 
 
-def _session_to_transcript(
+
+
+def _session_to_parts(
     df: pd.DataFrame,
     long_pause_threshold_ms: int,
-) -> str:
-
+) -> List[str]:
     file_states: Dict[str, str] = {}
     terminal_state: str = ""
     per_file_event_counts: Dict[str, int] = {}
@@ -160,12 +159,49 @@ def _session_to_transcript(
             case _:
                 raise ValueError(f"Unknown event type: {event_type}")
 
-    return "\n".join(parts).strip()
+    return parts
 
+
+def _chunk_parts(parts: List[str], target_chars: int, min_doc_chars: int) -> List[str]:
+    """Chunk by aggregating whole parts without splitting parts.
+
+    Each chunk is a concatenation of complete parts whose total length is as
+    close as possible to target_chars without exceeding it (except when a
+    single part alone exceeds target_chars, in which case it forms its own
+    chunk). No overlap is introduced between consecutive chunks.
+    """
+    if target_chars <= 0:
+        joined = "\n".join(parts).strip()
+        return [joined] if len(joined) >= min_doc_chars else []
+
+    chunks_out: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    def flush_current():
+        nonlocal current, current_len
+        if not current:
+            return
+        joined = "\n".join(current).strip()
+        if len(joined) >= min_doc_chars:
+            chunks_out.append(joined)
+        current = []
+        current_len = 0
+
+    for p in parts:
+        p_len = len(p) + 1  # account for newline joining
+        if current_len + p_len <= target_chars or not current:
+            current.append(p)
+            current_len += p_len
+        else:
+            flush_current()
+            # If the part itself exceeds target, still include it to preserve atomicity
+            current.append(p)
+            current_len = p_len
+    flush_current()
+    return chunks_out
 
  
-
-
 def load_hf_csv(hf_path: str, split: str) -> Dataset:
     loaded = load_dataset(hf_path, split=split)
 
@@ -173,18 +209,33 @@ def load_hf_csv(hf_path: str, split: str) -> Dataset:
     return loaded
 
 
+def _discover_local_sessions(root: Path) -> List[Path]:
+    # Recursively find all CSV files
+    paths: List[Path] = []
+    for p in root.rglob("*.csv"):
+        if p.is_file():
+            paths.append(p)
+    paths.sort()
+    return paths
+
+
 def to_parquet(
     cfg: SerializeConfig,
 ) -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    ds = load_hf_csv(cfg.hf_path, cfg.split)
-
     required_cols = ["Sequence", "Time", "File", "RangeOffset", "RangeLength", "Text", "Language", "Type"]
-    missing = [c for c in required_cols if c not in ds.column_names]
-    assert not missing, f"Missing required CSV columns: {missing}"
 
-    shards: List[Dataset] = [ds]
+    # Build a list of per-session DataFrames
+    session_dataframes: List[pd.DataFrame] = []
+    root = Path(cast(str, cfg.csv_root)).expanduser().resolve()
+    csv_files = _discover_local_sessions(root)
+    assert csv_files, f"No CSV files found under {root}"
+    for csv_file in csv_files:
+        df = pd.read_csv(csv_file)
+        missing_local = [c for c in required_cols if c not in df.columns]
+        assert not missing_local, f"Missing required CSV columns in {csv_file}: {missing_local}"
+        session_dataframes.append(df)
 
     rows_out = 0
     shard_idx = 0
@@ -202,15 +253,17 @@ def to_parquet(
         rows_out += len(df_out)
         buffer = []
 
-    for shard in shards:
-        pdf = cast(pd.DataFrame, shard.to_pandas())
-        session_df = pd.DataFrame(pdf.copy())
-        transcript = _session_to_transcript(
+    for session_df in session_dataframes:
+        session_df = pd.DataFrame(session_df.copy())
+        parts = _session_to_parts(
             session_df,
             long_pause_threshold_ms=cfg.long_pause_threshold_ms,
         )
-        buffer.append(transcript)
-        docs_written += 1
+        chunks = _chunk_parts(parts, cfg.target_chars, cfg.min_doc_chars)
+        if not chunks:
+            continue
+        buffer.extend(chunks)
+        docs_written += len(chunks)
         if len(buffer) >= cfg.shard_size:
             flush_buffer(shard_idx)
             shard_idx += 1
@@ -225,26 +278,23 @@ def to_parquet(
 
 def parse_args() -> SerializeConfig:
     p = argparse.ArgumentParser(description="Serialize HF CSV sessions to Parquet for MaxText Grain")
-    p.add_argument("--hf_path", type=str, required=True, help="HF repo id for the dataset (uses csv builder)")
-    p.add_argument("--split", type=str, default="train", help="Split name to load")
+    p.add_argument("--csv_root", type=str, required=True, help="Root directory containing per-session CSV files")
     p.add_argument("--output_dir", type=str, required=True, help="Output directory for Parquet shards")
     p.add_argument("--shard_size", type=int, default=20000, help="Rows per Parquet shard")
-    p.add_argument("--target_chars", type=int, default=8192, help="Target characters per document chunk")
-    p.add_argument("--overlap_chars", type=int, default=128, help="Character overlap between chunks")
-    p.add_argument("--min_doc_chars", type=int, default=256, help="Minimum characters to keep a chunk")
+    # FIXME(f.srambical): It is awkward that the target number is in character-space instead of in token-space.
+    p.add_argument("--target_chars", type=int, default=8192, help="Target characters per document chunk. This should be ~3-4x the max token length of the model you are using.")
+    p.add_argument("--min_doc_chars", type=int, default=1024, help="Minimum characters to keep a chunk")
     p.add_argument("--max_docs", type=int, default=None, help="Stop after writing this many unique docs")
     p.add_argument("--long_pause_threshold_ms", type=int, default=120000, help="Threshold (ms) to annotate long pauses and emit a keyframe")
     args = p.parse_args()
     return SerializeConfig(
-        hf_path=args.hf_path,
-        split=args.split,
         output_dir=args.output_dir,
         shard_size=args.shard_size,
         target_chars=args.target_chars,
-        overlap_chars=args.overlap_chars,
         min_doc_chars=args.min_doc_chars,
         max_docs=args.max_docs,
         long_pause_threshold_ms=args.long_pause_threshold_ms,
+        csv_root=(args.csv_root if args.csv_root else None),
     )
 
 
