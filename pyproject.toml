@@ -9,6 +9,8 @@ dependencies = [
     "pyarrow>=15.0.2",
     "tqdm>=4.66.4",
     "regex>=2024.5.15",
+    "array-record>=0.8.1",
+    "tensorflow>=2.20.0",
 ]
 
 [project.urls]
