@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
+import difflib
 import pandas as pd
 from datasets import Dataset, load_dataset
 
@@ -45,6 +46,73 @@ def _apply_change(content: str, offset: int, length: int, new_text: str) -> str:
     if offset > len(base):
         base = base + (" " * (offset - len(base)))
     return base[:offset] + text + base[offset + length:]
+
+
+def _line_numbered_output(content: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+    # TODO (f.srambical): check whether this corresponds **exactly** to the output of cat -n {file_path} | sed -n '{vstart},{vend}p'
+    lines = content.splitlines()
+    total = len(lines)
+    if total == 0:
+        return ""
+    s = 1 if start_line is None else max(1, min(start_line, total))
+    e = total if end_line is None else max(1, min(end_line, total))
+    if e < s:
+        # FIXME (f.srambical): If this does not happen, remove the condition
+        raise ValueError("This should never happen!")
+        e = s
+    buf: List[str] = []
+    for idx in range(s, e + 1):
+        buf.append(f"{idx:6}\t{lines[idx - 1]}")
+    return "\n".join(buf)
+
+
+def _compute_viewport(total_lines: int, center_line: int, radius: int) -> Tuple[int, int]:
+    if total_lines <= 0:
+        return (1, 0)
+    start = max(1, center_line - radius)
+    end = min(total_lines, center_line + radius)
+    if end < start:
+        # FIXME (f.srambical): If this does not happen, remove the condition
+        raise ValueError("This should never happen!")
+    return (start, end)
+
+
+def _escape_single_quotes_for_sed(text: str) -> str:
+    # Close quote, add an escaped single quote, reopen quote: '"'"'
+    return text.replace("'", "'\"'\"'")
+
+
+def _compute_changed_block_lines(before: str, after: str) -> Tuple[int, int, List[str]]:
+    """
+    Return 1-based start and end line numbers in 'before' that should be replaced,
+    and the replacement lines from 'after'.
+    Always returns at least one line.
+    """
+    before_lines = before.splitlines()
+    after_lines = after.splitlines()
+    sm = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
+    opcodes = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    if not opcodes:
+        # FIXME (f.srambical): clean this up
+        raise ValueError("This should never happen!")
+
+        # No visible change; choose a safe single-line replace at end of file
+        start_line = max(1, len(before_lines))
+        end_line = start_line
+        repl = after_lines[start_line - 1:start_line] if after_lines else [""]
+        return (start_line, end_line, repl)
+    first = opcodes[0]
+    last = opcodes[-1]
+    # i1/i2 refer to 'before' indices, j1/j2 to 'after'
+    start_line = (first[1] + 1) if (first[1] + 1) > 0 else 1
+    end_line = last[2]
+    if end_line < start_line:
+        end_line = start_line
+    repl = after_lines[first[3]:last[4]]
+    # Ensure at least one replacement line
+    if not repl:
+        repl = [""]
+    return (start_line, end_line, repl)
 
 
 def _session_to_transcript(
@@ -160,6 +228,122 @@ def _session_to_transcript(
 
     return "\n".join(parts).strip()
 
+
+def session_to_bash_formatted_transcript(
+    df: pd.DataFrame,
+    viewport_radius: int = 10,
+) -> str:
+    r"""
+    Serialize a session to a bash-like transcript comprised of:
+      - Commands (bash fenced blocks): cat -n, sed -i 'S,Ec\...' && cat -n | sed -n 'VSTART,VENDp'
+      - Outputs (<stdout>...</stdout>) that reflect the file state after each action
+    Tracks per-file state and a per-file viewport. Viewport only shifts when selection moves out of bounds
+    or when first initialized.
+    """
+    file_states: Dict[str, str] = {}
+    per_file_viewport: Dict[str, Optional[Tuple[int, int]]] = {}
+
+    parts: List[str] = []
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        file_path: str = row["File"]
+        event_type = row["Type"]
+
+        match event_type:
+            case "tab":
+                text = row["Text"]
+                if pd.notna(text):
+                    content = str(text).replace("\\n", "\n").replace("\\r", "\r")
+                    file_states[file_path] = content
+                    # First open with full file capture
+                    cmd = f"cat -n {file_path}"
+                    parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                    output = _line_numbered_output(content)
+                    parts.append(f"<stdout>\n{output}\n</stdout>")
+                else:
+                    # File switch without content snapshot: show current viewport only
+                    content = file_states.get(file_path, "")
+                    total_lines = len(content.splitlines())
+                    vp = per_file_viewport.get(file_path)
+                    if not vp or vp[1] == 0:
+                        vp = _compute_viewport(total_lines, 1, viewport_radius)
+                        per_file_viewport[file_path] = vp
+                    if vp:
+                        vstart, vend = vp
+                        cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
+                        parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                        viewport_output = _line_numbered_output(content, vstart, vend)
+                        parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+
+            case "content":
+                offset = int(row["RangeOffset"])
+                length = int(row["RangeLength"])
+                new_text = row["Text"]
+                before = file_states.get(file_path, "")
+                after = _apply_change(before, offset, length, new_text)
+                start_line, end_line, repl_lines = _compute_changed_block_lines(before, after)
+                # Prepare sed replacement payload
+                escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
+                sed_payload = "\n".join(escaped_lines)
+                sed_cmd = f"sed -i '{start_line},{end_line}c\\\n{sed_payload}' {file_path}"
+                # Determine viewport (initialize if needed; otherwise do not move it for edits)
+                total_lines = len(after.splitlines())
+                vp = per_file_viewport.get(file_path)
+                if not vp or vp[1] == 0:
+                    center = (start_line + end_line) // 2
+                    vp = _compute_viewport(total_lines, center, viewport_radius)
+                    per_file_viewport[file_path] = vp
+                vstart, vend = vp
+                chained_cmd = f"{sed_cmd} && cat -n {file_path} | sed -n '{vstart},{vend}p'"
+                parts.append(_fenced_block(file_path, "bash", _clean_text(chained_cmd)))
+                # Update state after emitting command
+                file_states[file_path] = after
+                viewport_output = _line_numbered_output(after, vstart, vend)
+                parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+
+            case "selection_command" | "selection_mouse" | "selection_keyboard":
+                offset = int(row["RangeOffset"])
+                content = file_states.get(file_path, "")
+                total_lines = len(content.splitlines())
+                target_line = content[:offset].count("\n") + 1
+                vp = per_file_viewport.get(file_path)
+                should_emit = False
+                if not vp or vp[1] == 0:
+                    vp = _compute_viewport(total_lines, target_line, viewport_radius)
+                    per_file_viewport[file_path] = vp
+                    should_emit = True
+                else:
+                    vstart, vend = vp
+                    if target_line < vstart or target_line > vend:
+                        vp = _compute_viewport(total_lines, target_line, viewport_radius)
+                        per_file_viewport[file_path] = vp
+                        should_emit = True
+                if should_emit and vp:
+                    vstart, vend = vp
+                    cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
+                    parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                    viewport_output = _line_numbered_output(content, vstart, vend)
+                    parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+
+            case "terminal_command":
+                command = row["Text"]
+                command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
+                parts.append(_fenced_block(file_path, "bash", _clean_text(command_str)))
+
+            case "terminal_output":
+                output = row["Text"]
+                output_str = str(output).replace("\\n", "\n").replace("\\r", "\r")
+                parts.append(f"<stdout>\n{_clean_text(output_str)}\n</stdout>")
+
+            case "terminal_focus" | "git_branch_checkout":
+                # FIXME (f.srambical): handle these events 
+                pass
+
+            case _:
+                raise ValueError(f"Unknown event type: {event_type}")
+
+    return "\n".join(parts).strip()
 
 def load_hf_csv(hf_path: str, split: str) -> Dataset:
     loaded = load_dataset(hf_path, split=split)
