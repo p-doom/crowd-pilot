@@ -18,6 +18,10 @@ from datasets import Dataset, load_dataset
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _ANSI_OSC_TERMINATED_RE = re.compile(r"\x1b\][\s\S]*?(?:\x07|\x1b\\)")
 _ANSI_OSC_LINE_FALLBACK_RE = re.compile(r"\x1b\][^\n]*$")
+_BRACKETED_PASTE_ENABLE = "\x1b[?2004h"
+_BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
+_OSC_633 = "\x1b]633;"
+_OSC_0 = "\x1b]0;"
 
 
 @dataclass
@@ -296,14 +300,69 @@ def session_to_bash_formatted_transcript(
     per_file_viewport: Dict[str, Optional[Tuple[int, int]]] = {}
 
     parts: List[str] = []
+    terminal_output_buffer: List[str] = []
+    pending_edits_before: Dict[str, Optional[str]] = {}
+
+    def _flush_terminal_output_buffer() -> None:
+        if not terminal_output_buffer:
+            return
+        aggregated = "".join(terminal_output_buffer)
+        out = aggregated
+        if normalize_terminal_output:
+            out = _normalize_terminal_output(out)
+        cleaned = _clean_text(out)
+        if cleaned.strip():
+            parts.append(f"<stdout>\n{cleaned}\n</stdout>")
+        terminal_output_buffer.clear()
+
+    def _flush_pending_edit_for_file(target_file: str) -> None:
+        before_snapshot = pending_edits_before.get(target_file)
+        if before_snapshot is None:
+            return
+        after_state = file_states.get(target_file, "")
+        try:
+            start_line, end_line, repl_lines = _compute_changed_block_lines(before_snapshot, after_state)
+        except ValueError:
+            pending_edits_before[target_file] = None
+            return
+        before_total_lines = len(before_snapshot.splitlines())
+        if end_line < start_line:
+            escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
+            sed_payload = "\n".join(escaped_lines)
+            if start_line <= max(1, before_total_lines):
+                sed_cmd = f"sed -i '{start_line}i\\\n{sed_payload}' {target_file}"
+            else:
+                sed_cmd = f"sed -i '$a\\\n{sed_payload}' {target_file}"
+        elif not repl_lines:
+            sed_cmd = f"sed -i '{start_line},{end_line}d' {target_file}"
+        else:
+            escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
+            sed_payload = "\n".join(escaped_lines)
+            sed_cmd = f"sed -i '{start_line},{end_line}c\\\n{sed_payload}' {target_file}"
+        total_lines = len(after_state.splitlines())
+        center = (start_line + end_line) // 2
+        vp = _compute_viewport(total_lines, center, viewport_radius)
+        per_file_viewport[target_file] = vp
+        vstart, vend = vp
+        chained_cmd = f"{sed_cmd} && cat -n {target_file} | sed -n '{vstart},{vend}p'"
+        parts.append(_fenced_block(target_file, "bash", _clean_text(chained_cmd)))
+        viewport_output = _line_numbered_output(after_state, vstart, vend)
+        parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+        pending_edits_before[target_file] = None
+
+    def _flush_all_pending_edits() -> None:
+        for fname in list(pending_edits_before.keys()):
+            _flush_pending_edit_for_file(fname)
 
     for i in range(len(df)):
         row = df.iloc[i]
         file_path: str = row["File"]
         event_type = row["Type"]
-
+        
         match event_type:
             case "tab":
+                _flush_all_pending_edits()
+                _flush_terminal_output_buffer()
                 text = row["Text"]
                 if pd.notna(text):
                     content = str(text).replace("\\n", "\n").replace("\\r", "\r")
@@ -329,46 +388,19 @@ def session_to_bash_formatted_transcript(
                         parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
 
             case "content":
+                _flush_terminal_output_buffer()
                 offset = int(row["RangeOffset"])
                 length = int(row["RangeLength"])
                 new_text = row["Text"]
                 before = file_states.get(file_path, "")
                 after = _apply_change(before, offset, length, new_text)
-                start_line, end_line, repl_lines = _compute_changed_block_lines(before, after)
-                # Prepare sed command based on change type: insert, delete, replace
-                before_total_lines = len(before.splitlines())
-                if end_line < start_line:
-                    # Pure insertion at position i1 (insert before start_line), or append at EOF
-                    escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
-                    sed_payload = "\n".join(escaped_lines)
-                    if start_line <= max(1, before_total_lines):
-                        sed_cmd = f"sed -i '{start_line}i\\\n{sed_payload}' {file_path}"
-                    else:
-                        sed_cmd = f"sed -i '$a\\\n{sed_payload}' {file_path}"
-                elif not repl_lines:
-                    # Pure deletion
-                    sed_cmd = f"sed -i '{start_line},{end_line}d' {file_path}"
-                else:
-                    # Replacement of a contiguous block
-                    escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
-                    sed_payload = "\n".join(escaped_lines)
-                    sed_cmd = f"sed -i '{start_line},{end_line}c\\\n{sed_payload}' {file_path}"
-                # Determine viewport (initialize if needed; otherwise do not move it for edits)
-                total_lines = len(after.splitlines())
-                vp = per_file_viewport.get(file_path)
-                if not vp or vp[1] == 0:
-                    center = (start_line + end_line) // 2
-                    vp = _compute_viewport(total_lines, center, viewport_radius)
-                    per_file_viewport[file_path] = vp
-                vstart, vend = vp
-                chained_cmd = f"{sed_cmd} && cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                parts.append(_fenced_block(file_path, "bash", _clean_text(chained_cmd)))
-                # Update state after emitting command
+                if pending_edits_before.get(file_path) is None:
+                    pending_edits_before[file_path] = before
                 file_states[file_path] = after
-                viewport_output = _line_numbered_output(after, vstart, vend)
-                parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
 
             case "selection_command" | "selection_mouse" | "selection_keyboard":
+                _flush_all_pending_edits()
+                _flush_terminal_output_buffer()
                 offset = int(row["RangeOffset"])
                 content = file_states.get(file_path, "")
                 total_lines = len(content.splitlines())
@@ -393,26 +425,30 @@ def session_to_bash_formatted_transcript(
                     parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
 
             case "terminal_command":
+                _flush_all_pending_edits()
+                _flush_terminal_output_buffer()
                 command = row["Text"]
                 command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
                 parts.append(_fenced_block(file_path, "bash", _clean_text(command_str)))
 
             case "terminal_output":
                 output = row["Text"]
-                output_str = str(output).replace("\\n", "\n").replace("\\r", "\r")
-                if normalize_terminal_output:
-                    output_str = _normalize_terminal_output(output_str)
-                cleaned = _clean_text(output_str)
-                if cleaned.strip():
-                    parts.append(f"<stdout>\n{cleaned}\n</stdout>")
+                raw_output = str(output).replace("\\n", "\n").replace("\\r", "\r")
+                terminal_output_buffer.append(raw_output)
 
             case "terminal_focus" | "git_branch_checkout":
+                _flush_all_pending_edits()
+                _flush_terminal_output_buffer()
                 # FIXME (f.srambical): handle these events 
                 pass
 
             case _:
+                _flush_all_pending_edits()
+                _flush_terminal_output_buffer()
                 raise ValueError(f"Unknown event type: {event_type}")
 
+    _flush_all_pending_edits()
+    _flush_terminal_output_buffer()
     return "\n".join(parts).strip()
 
 def load_hf_csv(hf_path: str, split: str) -> Dataset:
