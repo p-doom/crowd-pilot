@@ -10,8 +10,14 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import difflib
+import re
 import pandas as pd
 from datasets import Dataset, load_dataset
+
+
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_ANSI_OSC_TERMINATED_RE = re.compile(r"\x1b\][\s\S]*?(?:\x07|\x1b\\)")
+_ANSI_OSC_LINE_FALLBACK_RE = re.compile(r"\x1b\][^\n]*$")
 
 
 @dataclass
@@ -46,6 +52,56 @@ def _apply_change(content: str, offset: int, length: int, new_text: str) -> str:
     if offset > len(base):
         base = base + (" " * (offset - len(base)))
     return base[:offset] + text + base[offset + length:]
+
+
+def _apply_backspaces(text: str) -> str:
+    out: List[str] = []
+    for ch in text:
+        if ch == "\b":  # \x08
+            if out:
+                out.pop()
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _normalize_terminal_output(raw: str) -> str:
+    """
+    Normalize PTY/terminal output for training:
+      - Apply backspaces (\x08)
+      - Strip OSC (window title/shell integration) first, keeping BEL/ST terminators intact
+      - Resolve carriage returns (\r) by keeping the last rewrite per line
+      - Strip CSI (coloring etc.)
+      - Finally drop any remaining BEL (\x07)
+    """
+    if not raw:
+        return raw
+    s = _apply_backspaces(raw)
+    # Remove OSC sequences that are properly terminated (BEL or ST)
+    s = _ANSI_OSC_TERMINATED_RE.sub("", s)
+    # Fallback: drop any unterminated OSC up to end-of-line only
+    s = "\n".join(_ANSI_OSC_LINE_FALLBACK_RE.sub("", line) for line in s.split("\n"))
+    # Resolve carriage returns per line:
+    # - If there are multiple rewrites, keep the last non-empty chunk
+    # - If it's CRLF (ending with '\r' before '\n'), keep the content before '\r'
+    resolved_lines: List[str] = []
+    for seg in s.split("\n"):
+        parts = seg.split("\r")
+        chosen = ""
+        # pick last non-empty part if available; else last part
+        for p in reversed(parts):
+            if p != "":
+                chosen = p
+                break
+        if chosen == "" and parts:
+            chosen = parts[-1]
+        resolved_lines.append(chosen)
+    s = "\n".join(resolved_lines)
+    # Strip ANSI escape sequences
+    s = _ANSI_CSI_RE.sub("", s)
+    # Remove any remaining BEL beeps
+    s = s.replace("\x07", "")
+    return s
 
 
 def _line_numbered_output(content: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
@@ -86,7 +142,7 @@ def _compute_changed_block_lines(before: str, after: str) -> Tuple[int, int, Lis
     """
     Return 1-based start and end line numbers in 'before' that should be replaced,
     and the replacement lines from 'after'.
-    Always returns at least one line.
+    For pure deletions, the replacement list may be empty.
     """
     before_lines = before.splitlines()
     after_lines = after.splitlines()
@@ -94,25 +150,20 @@ def _compute_changed_block_lines(before: str, after: str) -> Tuple[int, int, Lis
     opcodes = [op for op in sm.get_opcodes() if op[0] != "equal"]
     if not opcodes:
         # FIXME (f.srambical): clean this up
-        raise ValueError("This should never happen!")
-
-        # No visible change; choose a safe single-line replace at end of file
+        raise ValueError("No diff opcodes found for content change")
+                # No visible change; choose a safe single-line replace at end of file
         start_line = max(1, len(before_lines))
         end_line = start_line
         repl = after_lines[start_line - 1:start_line] if after_lines else [""]
         return (start_line, end_line, repl)
+
     first = opcodes[0]
     last = opcodes[-1]
     # i1/i2 refer to 'before' indices, j1/j2 to 'after'
     start_line = (first[1] + 1) if (first[1] + 1) > 0 else 1
-    end_line = last[2]
-    if end_line < start_line:
-        end_line = start_line
-    repl = after_lines[first[3]:last[4]]
-    # Ensure at least one replacement line
-    if not repl:
-        repl = [""]
-    return (start_line, end_line, repl)
+    end_line = last[2] # no increment since we go from 'exclusive' to 'inclusive' indexing
+    replacement_lines = after_lines[first[3]:last[4]]
+    return (start_line, end_line, replacement_lines)
 
 
 def _session_to_transcript(
@@ -232,6 +283,7 @@ def _session_to_transcript(
 def session_to_bash_formatted_transcript(
     df: pd.DataFrame,
     viewport_radius: int = 10,
+    normalize_terminal_output: bool = True,
 ) -> str:
     r"""
     Serialize a session to a bash-like transcript comprised of:
@@ -283,10 +335,24 @@ def session_to_bash_formatted_transcript(
                 before = file_states.get(file_path, "")
                 after = _apply_change(before, offset, length, new_text)
                 start_line, end_line, repl_lines = _compute_changed_block_lines(before, after)
-                # Prepare sed replacement payload
-                escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
-                sed_payload = "\n".join(escaped_lines)
-                sed_cmd = f"sed -i '{start_line},{end_line}c\\\n{sed_payload}' {file_path}"
+                # Prepare sed command based on change type: insert, delete, replace
+                before_total_lines = len(before.splitlines())
+                if end_line < start_line:
+                    # Pure insertion at position i1 (insert before start_line), or append at EOF
+                    escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
+                    sed_payload = "\n".join(escaped_lines)
+                    if start_line <= max(1, before_total_lines):
+                        sed_cmd = f"sed -i '{start_line}i\\\n{sed_payload}' {file_path}"
+                    else:
+                        sed_cmd = f"sed -i '$a\\\n{sed_payload}' {file_path}"
+                elif not repl_lines:
+                    # Pure deletion
+                    sed_cmd = f"sed -i '{start_line},{end_line}d' {file_path}"
+                else:
+                    # Replacement of a contiguous block
+                    escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
+                    sed_payload = "\n".join(escaped_lines)
+                    sed_cmd = f"sed -i '{start_line},{end_line}c\\\n{sed_payload}' {file_path}"
                 # Determine viewport (initialize if needed; otherwise do not move it for edits)
                 total_lines = len(after.splitlines())
                 vp = per_file_viewport.get(file_path)
@@ -334,7 +400,11 @@ def session_to_bash_formatted_transcript(
             case "terminal_output":
                 output = row["Text"]
                 output_str = str(output).replace("\\n", "\n").replace("\\r", "\r")
-                parts.append(f"<stdout>\n{_clean_text(output_str)}\n</stdout>")
+                if normalize_terminal_output:
+                    output_str = _normalize_terminal_output(output_str)
+                cleaned = _clean_text(output_str)
+                if cleaned.strip():
+                    parts.append(f"<stdout>\n{cleaned}\n</stdout>")
 
             case "terminal_focus" | "git_branch_checkout":
                 # FIXME (f.srambical): handle these events 

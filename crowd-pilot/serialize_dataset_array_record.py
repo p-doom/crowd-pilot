@@ -18,7 +18,7 @@ from array_record.python import array_record_module as arm # type: ignore
 import tensorflow as tf 
 from serialization_utils import (
     SerializeConfig,
-    _session_to_transcript,
+    session_to_bash_formatted_transcript,
     _discover_local_sessions,
     _chunk_text,
 )
@@ -80,9 +80,8 @@ def to_array_record(
 
     for i, (session_df, session_path) in enumerate(session_dataframes):
         session_df = pd.DataFrame(session_df.copy())
-        transcript = _session_to_transcript(
+        transcript = session_to_bash_formatted_transcript(
             session_df,
-            long_pause_threshold_ms=cfg.long_pause_threshold_ms,
         )
         if len(transcript.strip()) < cfg.min_session_chars:
             print(f"Skipping session {session_path} because it's too short ({len(transcript.strip())} chars)")
