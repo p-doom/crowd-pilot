@@ -109,7 +109,7 @@ def _normalize_terminal_output(raw: str) -> str:
 
 
 def _line_numbered_output(content: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
-    # TODO (f.srambical): check whether this corresponds **exactly** to the output of cat -n {file_path} | sed -n '{vstart},{vend}p'
+    # FIXME (f.srambical): check whether this corresponds **exactly** to the output of cat -n {file_path} | sed -n '{vstart},{vend}p'
     lines = content.splitlines()
     total = len(lines)
     if total == 0:
@@ -464,11 +464,27 @@ def session_to_bash_formatted_transcript(
                 raw_output = str(output).replace("\\n", "\n").replace("\\r", "\r")
                 terminal_output_buffer.append(raw_output)
 
-            case "terminal_focus" | "git_branch_checkout":
+            case "terminal_focus":
                 _flush_all_pending_edits()
                 _flush_terminal_output_buffer()
-                # FIXME (f.srambical): handle these events 
+                # No-op for bash transcript; focus changes don't emit commands/output
                 pass
+
+            case "git_branch_checkout":
+                _flush_all_pending_edits()
+                _flush_terminal_output_buffer()
+                branch_info = row["Text"]
+                branch_str = str(branch_info).replace("\\n", "\n").replace("\\r", "\r")
+                cleaned = _clean_text(branch_str)
+                m = re.search(r"to '([^']+)'", cleaned)
+                if not m:
+                    raise ValueError(f"Could not extract branch name from git checkout message: {cleaned}")
+                branch_name = m.group(1).strip()
+                # Safe-quote branch if it contains special characters
+                if re.search(r"[^A-Za-z0-9._/\\-]", branch_name):
+                    branch_name = "'" + branch_name.replace("'", "'\"'\"'") + "'"
+                cmd = f"git checkout {branch_name}"
+                parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
 
             case _:
                 _flush_all_pending_edits()
