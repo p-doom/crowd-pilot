@@ -288,6 +288,7 @@ def session_to_bash_formatted_transcript(
     df: pd.DataFrame,
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
+    coalesce_radius: int = 5,
 ) -> str:
     r"""
     Serialize a session to a bash-like transcript comprised of:
@@ -302,6 +303,7 @@ def session_to_bash_formatted_transcript(
     parts: List[str] = []
     terminal_output_buffer: List[str] = []
     pending_edits_before: Dict[str, Optional[str]] = {}
+    pending_edit_regions: Dict[str, Optional[Tuple[int, int]]] = {}
 
     def _flush_terminal_output_buffer() -> None:
         if not terminal_output_buffer:
@@ -349,6 +351,7 @@ def session_to_bash_formatted_transcript(
         viewport_output = _line_numbered_output(after_state, vstart, vend)
         parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
         pending_edits_before[target_file] = None
+        pending_edit_regions[target_file] = None
 
     def _flush_all_pending_edits() -> None:
         for fname in list(pending_edits_before.keys()):
@@ -393,14 +396,39 @@ def session_to_bash_formatted_transcript(
                 length = int(row["RangeLength"])
                 new_text = row["Text"]
                 before = file_states.get(file_path, "")
+                # Approximate current edit region in line space
+                new_text_str = str(new_text) if pd.notna(new_text) else ""
+                start_line_current = before[:offset].count("\n") + 1
+                deleted_chunk = before[offset:offset + length]
+                lines_added = new_text_str.count("\n")
+                lines_deleted = deleted_chunk.count("\n")
+                region_start = start_line_current
+                region_end = start_line_current + max(lines_added, lines_deleted, 0)
+                # Flush pending edits if this edit is far from the pending region
+                current_region = pending_edit_regions.get(file_path)
+                if current_region is not None:
+                    rstart, rend = current_region
+                    if region_start < (rstart - coalesce_radius) or region_start > (rend + coalesce_radius):
+                        _flush_pending_edit_for_file(file_path)
+                        current_region = None
                 after = _apply_change(before, offset, length, new_text)
                 if pending_edits_before.get(file_path) is None:
                     pending_edits_before[file_path] = before
+                # Update/initialize region union
+                if current_region is None:
+                    pending_edit_regions[file_path] = (region_start, max(region_start, region_end))
+                else:
+                    rstart, rend = current_region
+                    pending_edit_regions[file_path] = (min(rstart, region_start), max(rend, region_end))
                 file_states[file_path] = after
 
             case "selection_command" | "selection_mouse" | "selection_keyboard":
-                _flush_all_pending_edits()
-                _flush_terminal_output_buffer()
+                # During an edit burst (pending edits), suppress flush and viewport emissions
+                if pending_edits_before.get(file_path) is None:
+                    _flush_terminal_output_buffer()
+                else:
+                    # Skip emitting viewport while edits are pending to avoid per-keystroke sed/cat spam
+                    continue
                 offset = int(row["RangeOffset"])
                 content = file_states.get(file_path, "")
                 total_lines = len(content.splitlines())
