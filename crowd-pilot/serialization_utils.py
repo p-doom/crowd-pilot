@@ -116,10 +116,7 @@ def _line_numbered_output(content: str, start_line: Optional[int] = None, end_li
         return ""
     s = 1 if start_line is None else max(1, min(start_line, total))
     e = total if end_line is None else max(1, min(end_line, total))
-    if e < s:
-        # FIXME (f.srambical): If this does not happen, remove the condition
-        raise ValueError("This should never happen!")
-        e = s
+    assert e >= s, "End line number cannot be less than start line number! Likely a bug in the line numbering computation."
     buf: List[str] = []
     for idx in range(s, e + 1):
         buf.append(f"{idx:6}\t{lines[idx - 1]}")
@@ -131,9 +128,7 @@ def _compute_viewport(total_lines: int, center_line: int, radius: int) -> Tuple[
         return (1, 0)
     start = max(1, center_line - radius)
     end = min(total_lines, center_line + radius)
-    if end < start:
-        # FIXME (f.srambical): If this does not happen, remove the condition
-        raise ValueError("This should never happen!")
+    assert end >= start, "Viewport cannot have negative width! Likely a bug in the viewport computation."
     return (start, end)
 
 
@@ -156,9 +151,7 @@ def _compute_changed_block_lines(
     after_lines = after.splitlines()
     sm = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
     opcodes = [op for op in sm.get_opcodes() if op[0] != "equal"]
-    if not opcodes:
-        # FIXME (f.srambical): clean this up
-        raise ValueError("This should never happen!")
+    assert opcodes, "Opcode list cannot be empty! Likely a bug in the diff computation."
 
     first = opcodes[0]
     last = opcodes[-1]
