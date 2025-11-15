@@ -142,10 +142,14 @@ def _escape_single_quotes_for_sed(text: str) -> str:
     return text.replace("'", "'\"'\"'")
 
 
-def _compute_changed_block_lines(before: str, after: str) -> Tuple[int, int, List[str]]:
+def _compute_changed_block_lines(
+    before: str, after: str
+) -> Tuple[int, int, int, int, List[str]]:
     """
-    Return 1-based start and end line numbers in 'before' that should be replaced,
-    and the replacement lines from 'after'.
+    Return 1-based start and end line numbers in 'before' that should be
+    replaced, 1-based start and end line numbers in 'after' that contain
+    the replacement, and the replacement lines from 'after'.
+
     For pure deletions, the replacement list may be empty.
     """
     before_lines = before.splitlines()
@@ -154,20 +158,17 @@ def _compute_changed_block_lines(before: str, after: str) -> Tuple[int, int, Lis
     opcodes = [op for op in sm.get_opcodes() if op[0] != "equal"]
     if not opcodes:
         # FIXME (f.srambical): clean this up
-        raise ValueError("No diff opcodes found for content change")
-                # No visible change; choose a safe single-line replace at end of file
-        start_line = max(1, len(before_lines))
-        end_line = start_line
-        repl = after_lines[start_line - 1:start_line] if after_lines else [""]
-        return (start_line, end_line, repl)
+        raise ValueError("This should never happen!")
 
     first = opcodes[0]
     last = opcodes[-1]
     # i1/i2 refer to 'before' indices, j1/j2 to 'after'
-    start_line = (first[1] + 1) if (first[1] + 1) > 0 else 1
-    end_line = last[2] # no increment since we go from 'exclusive' to 'inclusive' indexing
-    replacement_lines = after_lines[first[3]:last[4]]
-    return (start_line, end_line, replacement_lines)
+    start_before = max(1, first[1] + 1)
+    end_before = last[2]  # no increment since we go from 'exclusive' to 'inclusive' indexing
+    start_after = max(1, first[3] + 1)
+    end_after = last[4]
+    replacement_lines = after_lines[first[3] : last[4]]
+    return (start_before, end_before, start_after, end_after, replacement_lines)
 
 
 def _session_to_transcript(
@@ -323,26 +324,32 @@ def session_to_bash_formatted_transcript(
             return
         after_state = file_states.get(target_file, "")
         try:
-            start_line, end_line, repl_lines = _compute_changed_block_lines(before_snapshot, after_state)
+            (
+                start_before,
+                end_before,
+                start_after,
+                end_after,
+                repl_lines,
+            ) = _compute_changed_block_lines(before_snapshot, after_state)
         except ValueError:
             pending_edits_before[target_file] = None
             return
         before_total_lines = len(before_snapshot.splitlines())
-        if end_line < start_line:
+        if end_before < start_before:
             escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
             sed_payload = "\n".join(escaped_lines)
-            if start_line <= max(1, before_total_lines):
-                sed_cmd = f"sed -i '{start_line}i\\\n{sed_payload}' {target_file}"
+            if start_before <= max(1, before_total_lines):
+                sed_cmd = f"sed -i '{start_before}i\\\n{sed_payload}' {target_file}"
             else:
                 sed_cmd = f"sed -i '$a\\\n{sed_payload}' {target_file}"
         elif not repl_lines:
-            sed_cmd = f"sed -i '{start_line},{end_line}d' {target_file}"
+            sed_cmd = f"sed -i '{start_before},{end_before}d' {target_file}"
         else:
             escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
             sed_payload = "\n".join(escaped_lines)
-            sed_cmd = f"sed -i '{start_line},{end_line}c\\\n{sed_payload}' {target_file}"
+            sed_cmd = f"sed -i '{start_before},{end_before}c\\\n{sed_payload}' {target_file}"
         total_lines = len(after_state.splitlines())
-        center = (start_line + end_line) // 2
+        center = (start_after + end_after) // 2
         vp = _compute_viewport(total_lines, center, viewport_radius)
         per_file_viewport[target_file] = vp
         vstart, vend = vp
