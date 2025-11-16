@@ -316,17 +316,17 @@ def session_to_bash_formatted_transcript(
         if before_snapshot is None:
             return
         after_state = file_states.get(target_file, "")
-        try:
-            (
-                start_before,
-                end_before,
-                start_after,
-                end_after,
-                repl_lines,
-            ) = _compute_changed_block_lines(before_snapshot, after_state)
-        except ValueError:
+        if before_snapshot.rstrip("\n") == after_state.rstrip("\n"):
             pending_edits_before[target_file] = None
+            pending_edit_regions[target_file] = None
             return
+        (
+            start_before,
+            end_before,
+            start_after,
+            end_after,
+            repl_lines,
+        ) = _compute_changed_block_lines(before_snapshot, after_state)
         before_total_lines = len(before_snapshot.splitlines())
         if end_before < start_before:
             escaped_lines = [_escape_single_quotes_for_sed(line) for line in repl_lines]
