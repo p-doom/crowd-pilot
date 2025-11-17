@@ -20,7 +20,7 @@ import pandas as pd
 
 from serialization_utils import (
     SerializeConfig,
-    session_to_nemo_conversation,
+    session_to_nemo_conversation_chunks,
     _discover_local_sessions,
 )
 
@@ -64,35 +64,51 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             break
             
         session_df = pd.DataFrame(session_df.copy())
-        
-        # Convert directly to NeMo conversation format
-        conversations = session_to_nemo_conversation(session_df)
-        
-        num_turns = len(conversations)
-        session_turn_counts_all.append(num_turns)
-        session_chars = sum(len(turn.get("value", "")) for turn in conversations)
+
+        assert cfg.target_chars > 0, "target_chars must be positive"
+        conversation_chunks = session_to_nemo_conversation_chunks(
+            session_df,
+            cfg.target_chars,
+        )
+
+        assert len(conversation_chunks) >= 1, "At least one conversation chunk should be produced"
+
+        total_turns = sum(len(chunk) for chunk in conversation_chunks)
+        session_turn_counts_all.append(total_turns)
+        session_chars = sum(
+            len(turn.get("value", ""))
+            for chunk in conversation_chunks
+            for turn in chunk
+        )
         session_char_counts_all.append(session_chars)
 
-        if num_turns < cfg.min_session_turns:
-            print(f"[warning] Session {session_path} is too short ({num_turns} turns)")
+        if total_turns < cfg.min_session_turns:
+            print(f"[warning] Session {session_path} is too short ({total_turns} turns)")
             skipped_short_sessions += 1
             continue
         
-        session_turn_counts_kept.append(num_turns)
+        session_turn_counts_kept.append(total_turns)
         session_char_counts_kept.append(session_chars)
-        
-        record = {
-            "mask": "User",
-            "system": "",
-            "conversations": conversations
-        }
-        
-        if i < train_count:
-            train_conversations.append(record)
-        else:
-            val_conversations.append(record)
-        
-        docs_written += 1
+
+        for chunk in conversation_chunks:
+            if cfg.max_docs and docs_written >= cfg.max_docs:
+                break
+
+            record = {
+                "mask": "User",
+                "system": "",
+                "conversations": chunk,
+            }
+
+            if i < train_count:
+                train_conversations.append(record)
+            else:
+                val_conversations.append(record)
+
+            docs_written += 1
+
+        if cfg.max_docs and docs_written >= cfg.max_docs:
+            break
 
     train_path = Path(cfg.output_dir) / "train.jsonl"
     with open(train_path, 'w', encoding='utf-8') as f:
@@ -160,10 +176,14 @@ def parse_args() -> SerializeConfig:
                    help="Stop after writing this many unique docs")
     p.add_argument("--val_ratio", type=float, default=0.10, 
                    help="Fraction of sessions to route to validation [0,1)")
-    
+    p.add_argument(
+        "--target_chars",
+        type=int,
+        default=8192*3,
+        help="Approximate max characters per conversation chunk (<=0 disables chunking)",
+    )
     # These parameters are not used for JSONL output but kept for compatibility with SerializeConfig
     p.add_argument("--shard_size", type=int, default=20000, help="(unused for JSONL)")
-    p.add_argument("--target_chars", type=int, default=8192, help="(unused for JSONL)")
     p.add_argument("--overlap_chars", type=int, default=128, help="(unused for JSONL)")
     p.add_argument("--arrayrecord_group_size", type=int, default=1, help="(unused for JSONL)")
     

@@ -5,7 +5,7 @@ Common utilities for dataset serialization scripts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -35,6 +35,58 @@ class SerializeConfig:
     csv_root: Optional[str]
     val_ratio: float
     arrayrecord_group_size: Optional[int] = None
+
+
+@dataclass
+class ChunkState:
+    """
+    Mutable state used while constructing conversation chunks.
+    """
+    chunks: List[List[Dict[str, str]]]
+    max_chars_per_conversation: int
+    current_chunk: List[Dict[str, str]] = field(default_factory=list)
+    current_chars: int = 0
+    files_opened_in_chunk: set[str] = field(default_factory=set)
+
+    def start_new_chunk(self) -> None:
+        if self.current_chunk:
+            self.chunks.append(self.current_chunk)
+        self.current_chunk = []
+        self.current_chars = 0
+        self.files_opened_in_chunk.clear()
+
+    def append_turn(self, turn: Dict[str, str]) -> None:
+        value = turn.get("value", "")
+        turn_len = len(value)
+        if (
+            self.current_chunk  # only start a new chunk on non-empty current chunk
+            and self.current_chars + turn_len > self.max_chars_per_conversation
+        ):
+            self.start_new_chunk()
+        self.current_chunk.append(turn)
+        self.current_chars += turn_len
+
+    def maybe_capture_file_contents(
+        self,
+        file_path: str,
+        content: str,
+    ) -> None:
+        """
+        Capture the contents of the given file in the current chunk if it hasn't been opened yet.
+        """
+        if file_path in self.files_opened_in_chunk:
+            return
+        cmd = f"cat -n {file_path}"
+        self.append_turn({
+            "from": "Assistant",
+            "value": _fenced_block("bash", _clean_text(cmd)),
+        })
+        output = _line_numbered_output(content)
+        self.append_turn({
+            "from": "User",
+            "value": f"<stdout>\n{output}\n</stdout>",
+        })
+        self.files_opened_in_chunk.add(file_path)
 
 
 def _clean_text(text: str) -> str:
@@ -163,128 +215,31 @@ def _compute_changed_block_lines(
     return (start_before, end_before, start_after, end_after, replacement_lines)
 
 
-def _session_to_transcript(
+def session_to_nemo_conversation_chunks(
     df: pd.DataFrame,
-) -> str:
-
-    file_states: Dict[str, str] = {}
-    per_file_event_counts: Dict[str, int] = {}
-    per_file_cursor_positions: Dict[str, Tuple[int, int]] = {}  # (offset, length) for each file
-
-    parts: List[str] = []
-
-    for i in range(len(df)):
-        row = df.iloc[i]
-        file_path: str = row["File"]
-        language: Optional[str] = row["Language"]
-
-        event_type = row["Type"]
-
-        match event_type:
-            case "tab":
-                # File switch event
-                parts.append(f"<act focus file=\"{file_path}\" />")
-                
-                # If Text is present, this is the first time opening the file
-                # and the entire file content is captured
-                text = row["Text"]
-                if pd.notna(text):
-                    file_content = str(text).replace("\\n", "\n").replace("\\r", "\r")
-                    file_states[file_path] = file_content
-                    parts.append(f"// observation: file={file_path}")
-                    parts.append(_fenced_block(language, _clean_text(file_content)))
-
-            case "terminal_command":
-                # Terminal command execution
-                command = row["Text"]
-                command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
-                parts.append(f"<act terminal_command />")
-                parts.append(_fenced_block("bash", _clean_text(command_str)))
-
-            case "terminal_output":
-                # Terminal output capture
-                output = row["Text"]
-                output_str = str(output).replace("\\n", "\n").replace("\\r", "\r")
-                parts.append(f"<obs terminal_output />")
-                parts.append(_fenced_block(None, _clean_text(output_str)))
-
-            case "terminal_focus":
-                # Terminal focus event
-                parts.append(f"<act focus target=\"terminal\" />")
-
-            case "git_branch_checkout":
-                # Git branch checkout event
-                branch_info = row["Text"]
-                branch_str = str(branch_info).replace("\\n", "\n").replace("\\r", "\r")
-                parts.append(f"<act git_branch_checkout />")
-                parts.append(f"// git: {_clean_text(branch_str)}")
-
-            case "selection_command" | "selection_mouse" | "selection_keyboard":
-                # Handle cursor movement
-                offset = row["RangeOffset"]
-                length = row["RangeLength"]
-                old_cursor = per_file_cursor_positions.get(file_path, (0, 0))
-                new_cursor = (offset, length)
-                per_file_cursor_positions[file_path] = new_cursor
-                
-                # Emit cursor movement observation if position changed
-                if old_cursor != new_cursor:
-                    parts.append(f"<act cursor file=\"{file_path}\" offset=\"{offset}\" len=\"{length}\" />")
-
-            case "content":
-                # Handle file edit events
-                offset = row["RangeOffset"]
-                length = row["RangeLength"]
-                new_text = row["Text"]
-                new_text_str = str(new_text) if pd.notna(new_text) else ""
-
-                operation = "noop"
-                if length == 0 and new_text_str:
-                    operation = "insert"
-                elif length > 0 and not new_text_str:
-                    operation = "delete"
-                elif length > 0 and new_text_str:
-                    operation = "replace"
-
-                parts.append(f"<act {operation} file=\"{file_path}\" offset=\"{offset}\" len=\"{length}\" />")
-
-                if new_text_str and (operation == "insert" or operation == "replace"):
-                    parts.append(_fenced_block(language, _clean_text(new_text_str)))
-
-                before = file_states.get(file_path, "")
-                after = _apply_change(before, offset, length, new_text)
-                file_states[file_path] = after
-                per_file_event_counts[file_path] = per_file_event_counts.get(file_path, 0) + 1
-
-                # Update cursor position after edit (cursor moves to end of inserted/replaced text)
-                per_file_cursor_positions[file_path] = (offset + len(new_text_str), 0)
-
-            case _:
-                raise ValueError(f"Unknown event type: {event_type}")
-
-    return "\n".join(parts).strip()
-
-
-def session_to_nemo_conversation(
-    df: pd.DataFrame,
+    max_chars_per_conversation: int,
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
     coalesce_radius: int = 5,
-) -> List[Dict[str, str]]:
+) -> List[List[Dict[str, str]]]:
     """
-    Convert a session DataFrame directly to NeMo conversation format.
-    
-    Returns a list of conversation turns:
-    [
-        {"from": "Assistant", "value": "```bash\\ncommand\\n```"},
-        {"from": "User", "value": "<stdout>\\noutput\\n</stdout>"},
-        ...
-    ]
+    Convert a session DataFrame to one or more NeMo conversation chunks.
+
+    - Chunks are created by approximately limiting the total characters
+      across all `value` fields to `max_chars_per_conversation`.
+    - When a new chunk starts (after the first), the first time a file is
+      referenced in that chunk we re-log the full file contents with
+      `cat -n <file>` and numbered output so that each chunk is self-contained.
     """
     file_states: Dict[str, str] = {}
     per_file_viewport: Dict[str, Optional[Tuple[int, int]]] = {}
-    
-    conversations: List[Dict[str, str]] = []
+
+    chunks: List[List[Dict[str, str]]] = []
+    chunk_state = ChunkState(
+        chunks=chunks,
+        max_chars_per_conversation=max_chars_per_conversation,
+    )
+
     terminal_output_buffer: List[str] = []
     pending_edits_before: Dict[str, Optional[str]] = {}
     pending_edit_regions: Dict[str, Optional[Tuple[int, int]]] = {}
@@ -298,9 +253,9 @@ def session_to_nemo_conversation(
             out = _normalize_terminal_output(out)
         cleaned = _clean_text(out)
         if cleaned.strip():
-            conversations.append({
+            chunk_state.append_turn({
                 "from": "User",
-                "value": f"<stdout>\n{cleaned}\n</stdout>"
+                "value": f"<stdout>\n{cleaned}\n</stdout>",
             })
         terminal_output_buffer.clear()
 
@@ -339,15 +294,16 @@ def session_to_nemo_conversation(
         vp = _compute_viewport(total_lines, center, viewport_radius)
         per_file_viewport[target_file] = vp
         vstart, vend = vp
+        chunk_state.maybe_capture_file_contents(target_file, before_snapshot)
         chained_cmd = f"{sed_cmd} && cat -n {target_file} | sed -n '{vstart},{vend}p'"
-        conversations.append({
+        chunk_state.append_turn({
             "from": "Assistant",
-            "value": _fenced_block("bash", _clean_text(chained_cmd))
+            "value": _fenced_block("bash", _clean_text(chained_cmd)),
         })
         viewport_output = _line_numbered_output(after_state, vstart, vend)
-        conversations.append({
+        chunk_state.append_turn({
             "from": "User",
-            "value": f"<stdout>\n{viewport_output}\n</stdout>"
+            "value": f"<stdout>\n{viewport_output}\n</stdout>",
         })
         pending_edits_before[target_file] = None
         pending_edit_regions[target_file] = None
@@ -360,7 +316,7 @@ def session_to_nemo_conversation(
         row = df.iloc[i]
         file_path: str = row["File"]
         event_type = row["Type"]
-        
+
         match event_type:
             case "tab":
                 _flush_all_pending_edits()
@@ -369,17 +325,17 @@ def session_to_nemo_conversation(
                 if pd.notna(text):
                     content = str(text).replace("\\n", "\n").replace("\\r", "\r")
                     file_states[file_path] = content
-                    # First open with full file capture
                     cmd = f"cat -n {file_path}"
-                    conversations.append({
+                    chunk_state.append_turn({
                         "from": "Assistant",
-                        "value": _fenced_block("bash", _clean_text(cmd))
+                        "value": _fenced_block("bash", _clean_text(cmd)),
                     })
                     output = _line_numbered_output(content)
-                    conversations.append({
+                    chunk_state.append_turn({
                         "from": "User",
-                        "value": f"<stdout>\n{output}\n</stdout>"
+                        "value": f"<stdout>\n{output}\n</stdout>",
                     })
+                    chunk_state.files_opened_in_chunk.add(file_path)
                 else:
                     # File switch without content snapshot: show current viewport only
                     content = file_states.get(file_path, "")
@@ -390,15 +346,16 @@ def session_to_nemo_conversation(
                         per_file_viewport[file_path] = vp
                     if vp:
                         vstart, vend = vp
+                        chunk_state.maybe_capture_file_contents(file_path, content)
                         cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                        conversations.append({
+                        chunk_state.append_turn({
                             "from": "Assistant",
-                            "value": _fenced_block("bash", _clean_text(cmd))
+                            "value": _fenced_block("bash", _clean_text(cmd)),
                         })
                         viewport_output = _line_numbered_output(content, vstart, vend)
-                        conversations.append({
+                        chunk_state.append_turn({
                             "from": "User",
-                            "value": f"<stdout>\n{viewport_output}\n</stdout>"
+                            "value": f"<stdout>\n{viewport_output}\n</stdout>",
                         })
 
             case "content":
@@ -458,15 +415,16 @@ def session_to_nemo_conversation(
                         should_emit = True
                 if should_emit and vp:
                     vstart, vend = vp
+                    chunk_state.maybe_capture_file_contents(file_path, content)
                     cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                    conversations.append({
+                    chunk_state.append_turn({
                         "from": "Assistant",
-                        "value": _fenced_block("bash", _clean_text(cmd))
+                        "value": _fenced_block("bash", _clean_text(cmd)),
                     })
                     viewport_output = _line_numbered_output(content, vstart, vend)
-                    conversations.append({
+                    chunk_state.append_turn({
                         "from": "User",
-                        "value": f"<stdout>\n{viewport_output}\n</stdout>"
+                        "value": f"<stdout>\n{viewport_output}\n</stdout>",
                     })
 
             case "terminal_command":
@@ -474,9 +432,9 @@ def session_to_nemo_conversation(
                 _flush_terminal_output_buffer()
                 command = row["Text"]
                 command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
-                conversations.append({
+                chunk_state.append_turn({
                     "from": "Assistant",
-                    "value": _fenced_block("bash", _clean_text(command_str))
+                    "value": _fenced_block("bash", _clean_text(command_str)),
                 })
 
             case "terminal_output":
@@ -504,9 +462,9 @@ def session_to_nemo_conversation(
                 if re.search(r"[^A-Za-z0-9._/\\-]", branch_name):
                     branch_name = "'" + branch_name.replace("'", "'\"'\"'") + "'"
                 cmd = f"git checkout {branch_name}"
-                conversations.append({
+                chunk_state.append_turn({
                     "from": "Assistant",
-                    "value": _fenced_block("bash", _clean_text(cmd))
+                    "value": _fenced_block("bash", _clean_text(cmd)),
                 })
 
             case _:
@@ -514,7 +472,9 @@ def session_to_nemo_conversation(
 
     _flush_all_pending_edits()
     _flush_terminal_output_buffer()
-    return conversations
+    if chunk_state.current_chunk:
+        chunks.append(chunk_state.current_chunk)
+    return chunks
 
 
 
@@ -533,34 +493,3 @@ def _discover_local_sessions(root: Path) -> List[Path]:
             paths.append(p)
     paths.sort()
     return paths
-
-
-def _chunk_text(text: str, target_chars: int, overlap_chars: int) -> List[str]:
-    """Split a long text into overlapping chunks near target length."""
-    if target_chars <= 0:
-        return [text]
-    n = len(text)
-    if n <= target_chars:
-        return [text]
-
-    chunks: List[str] = []
-    start = 0
-    # Ensure sane overlap
-    overlap = max(0, min(overlap_chars, target_chars // 2))
-    while start < n:
-        end_target = min(start + target_chars, n)
-        if end_target < n:
-            end = end_target
-        else:
-            end = n
-        chunk = text[start:end].strip()
-        chunks.append(chunk)
-        if end == n:
-            break
-        # advance with overlap
-        start = max(0, end - overlap)
-        if start >= n:
-            break
-    return chunks
-
-
