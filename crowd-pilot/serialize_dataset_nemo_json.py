@@ -54,6 +54,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     
     session_turn_counts_all: List[int] = []
     session_turn_counts_kept: List[int] = []
+    session_char_counts_all: List[int] = []
+    session_char_counts_kept: List[int] = []
     skipped_short_sessions = 0
     docs_written = 0
 
@@ -68,11 +70,16 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         
         num_turns = len(conversations)
         session_turn_counts_all.append(num_turns)
+        session_chars = sum(len(turn.get("value", "")) for turn in conversations)
+        session_char_counts_all.append(session_chars)
 
         if num_turns < cfg.min_session_turns:
             print(f"[warning] Session {session_path} is too short ({num_turns} turns)")
             skipped_short_sessions += 1
             continue
+        
+        session_turn_counts_kept.append(num_turns)
+        session_char_counts_kept.append(session_chars)
         
         record = {
             "mask": "User",
@@ -108,11 +115,27 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         max_len = max(values)
         print(
             f"[debug] {label.capitalize()} sessions turn stats: "
-            f"count={count}, avg={avg:.1f}, min={min_len}, max={max_len}"
+            f"count={count}, avg_turns={avg:.1f}, min_turns={min_len}, max_turns={max_len}"
+        )
+
+    def _print_char_stats(label: str, values: List[int]) -> None:
+        if not values:
+            print(f"[debug] No {label} sessions for character stats.")
+            return
+        count = len(values)
+        total = sum(values)
+        avg = total / count
+        min_len = min(values)
+        max_len = max(values)
+        print(
+            f"[debug] {label.capitalize()} sessions char stats: "
+            f"count={count}, avg_chars={avg:.1f}, min_chars={min_len}, max_chars={max_len}"
         )
 
     _print_turn_stats("all", session_turn_counts_all)
     _print_turn_stats("kept", session_turn_counts_kept)
+    _print_char_stats("all", session_char_counts_all)
+    _print_char_stats("kept", session_char_counts_kept)
     
     print(f"\n[summary]")
     print(f"  Total sessions processed: {total_sessions}")
