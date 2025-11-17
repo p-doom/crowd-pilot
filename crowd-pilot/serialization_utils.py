@@ -30,9 +30,8 @@ class SerializeConfig:
     shard_size: int
     target_chars: int
     overlap_chars: int
-    min_session_chars: int
+    min_session_turns: int
     max_docs: Optional[int]
-    long_pause_threshold_ms: int
     csv_root: Optional[str]
     val_ratio: float
     arrayrecord_group_size: Optional[int] = None
@@ -43,7 +42,7 @@ def _clean_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
 
 
-def _fenced_block(path: str, language: Optional[str], content: str) -> str:
+def _fenced_block(language: Optional[str], content: str) -> str:
     lang = (language or "").lower()
     return f"```{lang}\n{content}\n```\n"
 
@@ -166,30 +165,18 @@ def _compute_changed_block_lines(
 
 def _session_to_transcript(
     df: pd.DataFrame,
-    long_pause_threshold_ms: int,
 ) -> str:
 
     file_states: Dict[str, str] = {}
-    terminal_state: str = ""
     per_file_event_counts: Dict[str, int] = {}
     per_file_cursor_positions: Dict[str, Tuple[int, int]] = {}  # (offset, length) for each file
-    last_time_ms: Optional[int] = None
 
     parts: List[str] = []
 
     for i in range(len(df)):
         row = df.iloc[i]
         file_path: str = row["File"]
-        event_time: int = row["Time"]
         language: Optional[str] = row["Language"]
-
-        # Long pause detection
-        if last_time_ms is not None:
-            delta = event_time - last_time_ms
-            if delta > long_pause_threshold_ms:
-                # TODO (f.srambical): think about whether we want to emit this as an observation or not
-                parts.append(f"<obs long_pause ms=\"{delta}\" />")
-        last_time_ms = event_time
 
         event_type = row["Type"]
 
@@ -205,21 +192,21 @@ def _session_to_transcript(
                     file_content = str(text).replace("\\n", "\n").replace("\\r", "\r")
                     file_states[file_path] = file_content
                     parts.append(f"// observation: file={file_path}")
-                    parts.append(_fenced_block(file_path, language, _clean_text(file_content)))
+                    parts.append(_fenced_block(language, _clean_text(file_content)))
 
             case "terminal_command":
                 # Terminal command execution
                 command = row["Text"]
                 command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
                 parts.append(f"<act terminal_command />")
-                parts.append(_fenced_block(file_path, "bash", _clean_text(command_str)))
+                parts.append(_fenced_block("bash", _clean_text(command_str)))
 
             case "terminal_output":
                 # Terminal output capture
                 output = row["Text"]
                 output_str = str(output).replace("\\n", "\n").replace("\\r", "\r")
                 parts.append(f"<obs terminal_output />")
-                parts.append(_fenced_block(file_path, None, _clean_text(output_str)))
+                parts.append(_fenced_block(None, _clean_text(output_str)))
 
             case "terminal_focus":
                 # Terminal focus event
@@ -262,7 +249,7 @@ def _session_to_transcript(
                 parts.append(f"<act {operation} file=\"{file_path}\" offset=\"{offset}\" len=\"{length}\" />")
 
                 if new_text_str and (operation == "insert" or operation == "replace"):
-                    parts.append(_fenced_block(file_path, language, _clean_text(new_text_str)))
+                    parts.append(_fenced_block(language, _clean_text(new_text_str)))
 
                 before = file_states.get(file_path, "")
                 after = _apply_change(before, offset, length, new_text)
@@ -278,23 +265,26 @@ def _session_to_transcript(
     return "\n".join(parts).strip()
 
 
-def session_to_bash_formatted_transcript(
+def session_to_nemo_conversation(
     df: pd.DataFrame,
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
     coalesce_radius: int = 5,
-) -> str:
-    r"""
-    Serialize a session to a bash-like transcript comprised of:
-      - Commands (bash fenced blocks): cat -n, sed -i 'S,Ec\...' && cat -n | sed -n 'VSTART,VENDp'
-      - Outputs (<stdout>...</stdout>) that reflect the file state after each action
-    Tracks per-file state and a per-file viewport. Viewport only shifts when selection moves out of bounds
-    or when first initialized.
+) -> List[Dict[str, str]]:
+    """
+    Convert a session DataFrame directly to NeMo conversation format.
+    
+    Returns a list of conversation turns:
+    [
+        {"from": "Assistant", "value": "```bash\\ncommand\\n```"},
+        {"from": "User", "value": "<stdout>\\noutput\\n</stdout>"},
+        ...
+    ]
     """
     file_states: Dict[str, str] = {}
     per_file_viewport: Dict[str, Optional[Tuple[int, int]]] = {}
-
-    parts: List[str] = []
+    
+    conversations: List[Dict[str, str]] = []
     terminal_output_buffer: List[str] = []
     pending_edits_before: Dict[str, Optional[str]] = {}
     pending_edit_regions: Dict[str, Optional[Tuple[int, int]]] = {}
@@ -308,7 +298,10 @@ def session_to_bash_formatted_transcript(
             out = _normalize_terminal_output(out)
         cleaned = _clean_text(out)
         if cleaned.strip():
-            parts.append(f"<stdout>\n{cleaned}\n</stdout>")
+            conversations.append({
+                "from": "User",
+                "value": f"<stdout>\n{cleaned}\n</stdout>"
+            })
         terminal_output_buffer.clear()
 
     def _flush_pending_edit_for_file(target_file: str) -> None:
@@ -347,9 +340,15 @@ def session_to_bash_formatted_transcript(
         per_file_viewport[target_file] = vp
         vstart, vend = vp
         chained_cmd = f"{sed_cmd} && cat -n {target_file} | sed -n '{vstart},{vend}p'"
-        parts.append(_fenced_block(target_file, "bash", _clean_text(chained_cmd)))
+        conversations.append({
+            "from": "Assistant",
+            "value": _fenced_block("bash", _clean_text(chained_cmd))
+        })
         viewport_output = _line_numbered_output(after_state, vstart, vend)
-        parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+        conversations.append({
+            "from": "User",
+            "value": f"<stdout>\n{viewport_output}\n</stdout>"
+        })
         pending_edits_before[target_file] = None
         pending_edit_regions[target_file] = None
 
@@ -372,9 +371,15 @@ def session_to_bash_formatted_transcript(
                     file_states[file_path] = content
                     # First open with full file capture
                     cmd = f"cat -n {file_path}"
-                    parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                    conversations.append({
+                        "from": "Assistant",
+                        "value": _fenced_block("bash", _clean_text(cmd))
+                    })
                     output = _line_numbered_output(content)
-                    parts.append(f"<stdout>\n{output}\n</stdout>")
+                    conversations.append({
+                        "from": "User",
+                        "value": f"<stdout>\n{output}\n</stdout>"
+                    })
                 else:
                     # File switch without content snapshot: show current viewport only
                     content = file_states.get(file_path, "")
@@ -386,9 +391,15 @@ def session_to_bash_formatted_transcript(
                     if vp:
                         vstart, vend = vp
                         cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                        parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                        conversations.append({
+                            "from": "Assistant",
+                            "value": _fenced_block("bash", _clean_text(cmd))
+                        })
                         viewport_output = _line_numbered_output(content, vstart, vend)
-                        parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+                        conversations.append({
+                            "from": "User",
+                            "value": f"<stdout>\n{viewport_output}\n</stdout>"
+                        })
 
             case "content":
                 _flush_terminal_output_buffer()
@@ -448,16 +459,25 @@ def session_to_bash_formatted_transcript(
                 if should_emit and vp:
                     vstart, vend = vp
                     cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                    parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                    conversations.append({
+                        "from": "Assistant",
+                        "value": _fenced_block("bash", _clean_text(cmd))
+                    })
                     viewport_output = _line_numbered_output(content, vstart, vend)
-                    parts.append(f"<stdout>\n{viewport_output}\n</stdout>")
+                    conversations.append({
+                        "from": "User",
+                        "value": f"<stdout>\n{viewport_output}\n</stdout>"
+                    })
 
             case "terminal_command":
                 _flush_all_pending_edits()
                 _flush_terminal_output_buffer()
                 command = row["Text"]
                 command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
-                parts.append(_fenced_block(file_path, "bash", _clean_text(command_str)))
+                conversations.append({
+                    "from": "Assistant",
+                    "value": _fenced_block("bash", _clean_text(command_str))
+                })
 
             case "terminal_output":
                 output = row["Text"]
@@ -484,16 +504,19 @@ def session_to_bash_formatted_transcript(
                 if re.search(r"[^A-Za-z0-9._/\\-]", branch_name):
                     branch_name = "'" + branch_name.replace("'", "'\"'\"'") + "'"
                 cmd = f"git checkout {branch_name}"
-                parts.append(_fenced_block(file_path, "bash", _clean_text(cmd)))
+                conversations.append({
+                    "from": "Assistant",
+                    "value": _fenced_block("bash", _clean_text(cmd))
+                })
 
             case _:
-                _flush_all_pending_edits()
-                _flush_terminal_output_buffer()
                 raise ValueError(f"Unknown event type: {event_type}")
 
     _flush_all_pending_edits()
     _flush_terminal_output_buffer()
-    return "\n".join(parts).strip()
+    return conversations
+
+
 
 def load_hf_csv(hf_path: str, split: str) -> Dataset:
     loaded = load_dataset(hf_path, split=split)
