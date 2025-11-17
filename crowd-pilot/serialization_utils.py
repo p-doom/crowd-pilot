@@ -27,14 +27,12 @@ _OSC_0 = "\x1b]0;"
 @dataclass
 class SerializeConfig:
     output_dir: str
-    shard_size: int
-    target_chars: int
-    overlap_chars: int
+    target_chars_per_conversation: int
+    target_chars_per_turn: int
     min_session_turns: int
     max_docs: Optional[int]
     csv_root: Optional[str]
     val_ratio: float
-    arrayrecord_group_size: Optional[int] = None
 
 
 @dataclass
@@ -44,6 +42,7 @@ class ChunkState:
     """
     chunks: List[List[Dict[str, str]]]
     max_chars_per_conversation: int
+    max_chars_per_turn: int
     current_chunk: List[Dict[str, str]] = field(default_factory=list)
     current_chars: int = 0
     files_opened_in_chunk: set[str] = field(default_factory=set)
@@ -57,6 +56,11 @@ class ChunkState:
 
     def append_turn(self, turn: Dict[str, str]) -> None:
         value = turn.get("value", "")
+        # Enforce a per-turn character budget to prevent pathological single
+        # turns (e.g., massive file dumps) from creating multi-megabyte chunks.
+        if len(value) > self.max_chars_per_turn:
+            value = value[: self.max_chars_per_turn]
+            turn["value"] = value
         turn_len = len(value)
         if (
             self.current_chunk  # only start a new chunk on non-empty current chunk
@@ -218,6 +222,7 @@ def _compute_changed_block_lines(
 def session_to_nemo_conversation_chunks(
     df: pd.DataFrame,
     max_chars_per_conversation: int,
+    max_chars_per_turn: int,
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
     coalesce_radius: int = 5,
@@ -238,6 +243,7 @@ def session_to_nemo_conversation_chunks(
     chunk_state = ChunkState(
         chunks=chunks,
         max_chars_per_conversation=max_chars_per_conversation,
+        max_chars_per_turn=max_chars_per_turn,
     )
 
     terminal_output_buffer: List[str] = []
