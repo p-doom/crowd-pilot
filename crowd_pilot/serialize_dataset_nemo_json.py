@@ -103,7 +103,7 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
 
             record = {
                 "mask": "User",
-                "system": "",
+                "system": "You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.\nYour response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).\n\nFormat your response as shown in <format_example>.\n\n<format_example>\n```bash\nyour_command_here\n```\n</format_example>\n\nFailure to follow these rules will cause your response to be rejected.",
                 "conversations": chunk,
             }
 
