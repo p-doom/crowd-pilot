@@ -56,7 +56,6 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     chunk_turn_counts_kept: List[int] = []
     chunk_char_counts_all: List[int] = []
     chunk_char_counts_kept: List[int] = []
-    skipped_short_sessions = 0
     sessions_kept = 0
     docs_written = 0
 
@@ -72,6 +71,7 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             session_df,
             cfg.target_chars_per_conversation,
             max_chars_per_turn=cfg.target_chars_per_turn,
+            min_conversation_turns=cfg.min_conversation_turns,
         )
 
         assert len(conversation_chunks) >= 1, "At least one conversation chunk should be produced"
@@ -84,14 +84,6 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         ]
         chunk_turn_counts_all.extend(per_chunk_turns)
         chunk_char_counts_all.extend(per_chunk_chars)
-
-        # Aggregate per-session turns for filtering
-        total_turns = sum(per_chunk_turns)
-
-        if total_turns < cfg.min_session_turns:
-            print(f"[warning] Session {session_path} is too short ({total_turns} turns)")
-            skipped_short_sessions += 1
-            continue
         
         chunk_turn_counts_kept.extend(per_chunk_turns)
         chunk_char_counts_kept.extend(per_chunk_chars)
@@ -182,7 +174,6 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     print(f"\n[summary]")
     print(f"  Total sessions processed: {total_sessions}")
     print(f"  Sessions kept: {sessions_kept}")
-    print(f"  Skipped (too few turns): {skipped_short_sessions}")
     print(f"  Train conversations: {len(train_conversations)}")
     print(f"  Val conversations: {len(val_conversations)}")
     print(f"  Output: {cfg.output_dir}/{{train,val}}.jsonl")
@@ -191,7 +182,7 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         "config": {
             "csv_root": cfg.csv_root,
             "output_dir": cfg.output_dir,
-            "min_session_turns": cfg.min_session_turns,
+            "min_conversation_turns": cfg.min_conversation_turns,
             "max_docs": cfg.max_docs,
             "val_ratio": cfg.val_ratio,
             "target_chars_per_conversation": cfg.target_chars_per_conversation,
@@ -200,7 +191,6 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         "counts": {
             "total_sessions": total_sessions,
             "sessions_kept": sessions_kept,
-            "skipped_short_sessions": skipped_short_sessions,
             "train_conversations": len(train_conversations),
             "val_conversations": len(val_conversations),
             "docs_written": docs_written,
@@ -232,8 +222,8 @@ def parse_args() -> SerializeConfig:
                    help="Root directory containing per-session CSV files")
     p.add_argument("--output_dir", type=str, required=True, 
                    help="Output directory for JSONL files")
-    p.add_argument("--min_session_turns", type=int, default=10, 
-                   help="Minimum number of turns to keep a session")
+    p.add_argument("--min_conversation_turns", type=int, default=5, 
+                   help="Minimum number of turns to keep a conversation chunk")
     p.add_argument("--max_docs", type=int, default=None, 
                    help="Stop after writing this many unique docs")
     p.add_argument("--val_ratio", type=float, default=0.10, 
@@ -250,7 +240,7 @@ def parse_args() -> SerializeConfig:
         output_dir=args.output_dir,
         target_chars_per_conversation=args.target_chars_per_conversation,
         target_chars_per_turn=args.target_chars_per_turn,
-        min_session_turns=args.min_session_turns,
+        min_conversation_turns=args.min_conversation_turns,
         max_docs=args.max_docs,
         csv_root=(args.csv_root if args.csv_root else None),
         val_ratio=args.val_ratio,
