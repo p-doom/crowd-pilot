@@ -12,17 +12,27 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
-from typing import List, Tuple, cast
 import random
+from pathlib import Path
+from typing import List, Tuple, cast, Optional
+from dataclasses import dataclass
 
 import pandas as pd
 
 from serialization_utils import (
-    SerializeConfig,
     session_to_nemo_conversation_chunks,
     _discover_local_sessions,
 )
+
+@dataclass
+class SerializeConfig:
+    output_dir: str
+    max_chars_per_conversation: int
+    max_chars_per_turn: int
+    min_conversation_turns: int
+    max_docs: Optional[int]
+    csv_root: Optional[str]
+    val_ratio: float
 
 
 def to_nemo_jsonl(cfg: SerializeConfig) -> None:
@@ -52,8 +62,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     train_conversations = []
     val_conversations = []
     
-    chunk_turn_counts: List[int] = []
-    chunk_char_counts: List[int] = []
+    turn_counts: List[int] = []
+    char_counts: List[int] = []
     docs_written = 0
 
     for i, (session_df, session_path) in enumerate(session_dataframes):
@@ -62,12 +72,12 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             
         session_df = pd.DataFrame(session_df.copy())
 
-        assert cfg.target_chars_per_conversation > 0, "target_chars_per_conversation must be positive"
-        assert cfg.target_chars_per_turn > 0, "target_chars_per_turn must be positive"
+        assert cfg.max_chars_per_conversation > 0, "max_chars_per_conversation must be positive"
+        assert cfg.max_chars_per_turn > 0, "max_chars_per_turn must be positive"
         conversation_chunks = session_to_nemo_conversation_chunks(
             session_df,
-            cfg.target_chars_per_conversation,
-            max_chars_per_turn=cfg.target_chars_per_turn,
+            cfg.max_chars_per_conversation,
+            max_chars_per_turn=cfg.max_chars_per_turn,
             min_conversation_turns=cfg.min_conversation_turns,
         )
 
@@ -78,8 +88,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             for chunk in conversation_chunks
         ]
         
-        chunk_turn_counts.extend(per_chunk_turns)
-        chunk_char_counts.extend(per_chunk_chars)
+        turn_counts.extend(per_chunk_turns)
+        char_counts.extend(per_chunk_chars)
 
         for chunk in conversation_chunks:
             if cfg.max_docs and docs_written >= cfg.max_docs:
@@ -101,12 +111,12 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         if cfg.max_docs and docs_written >= cfg.max_docs:
             break
 
-    train_path = Path(cfg.output_dir) / "train.jsonl"
+    train_path = Path(cfg.output_dir) / "training.jsonl"
     with open(train_path, 'w', encoding='utf-8') as f:
         for record in train_conversations:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
     
-    val_path = Path(cfg.output_dir) / "val.jsonl"
+    val_path = Path(cfg.output_dir) / "validation.jsonl"
     with open(val_path, 'w', encoding='utf-8') as f:
         for record in val_conversations:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
@@ -158,14 +168,11 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             f"min_chars={stats['min']}, max_chars={stats['max']}"
         )
 
-    _print_turn_stats("kept", chunk_turn_counts)
-    _print_char_stats("kept", chunk_char_counts)
-
     print(f"\n[summary]")
     print(f"  Total sessions processed: {total_sessions}")
     print(f"  Train conversations: {len(train_conversations)}")
     print(f"  Val conversations: {len(val_conversations)}")
-    print(f"  Output: {cfg.output_dir}/{{train,val}}.jsonl")
+    print(f"  Output: {cfg.output_dir}/{{training,validation}}.jsonl")
 
     metadata = {
         "config": {
@@ -174,8 +181,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             "min_conversation_turns": cfg.min_conversation_turns,
             "max_docs": cfg.max_docs,
             "val_ratio": cfg.val_ratio,
-            "target_chars_per_conversation": cfg.target_chars_per_conversation,
-            "target_chars_per_turn": cfg.target_chars_per_turn,
+            "max_chars_per_conversation": cfg.max_chars_per_conversation,
+            "max_chars_per_turn": cfg.max_chars_per_turn,
         },
         "counts": {
             "total_sessions": total_sessions,
@@ -183,8 +190,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             "val_conversations": len(val_conversations),
             "docs_written": docs_written,
         },
-        "chunk_turn_stats": _compute_stats(chunk_turn_counts),
-        "chunk_char_stats": _compute_stats(chunk_char_counts),
+        "turn_stats": _compute_stats(turn_counts),
+        "char_stats": _compute_stats(char_counts),
         "files": {
             "train_path": str(train_path),
             "val_path": str(val_path),
@@ -211,17 +218,17 @@ def parse_args() -> SerializeConfig:
     p.add_argument("--val_ratio", type=float, default=0.10, 
                    help="Fraction of sessions to route to validation [0,1)")
     p.add_argument(
-        "--target_chars_per_conversation",
+        "--max_chars_per_conversation",
         type=int,
         default=8192*16*3,
-        help="Target characters per conversation chunk",
+        help="Maximum characters per conversation chunk",
     )
-    p.add_argument("--target_chars_per_turn", type=int, default=8192*3, help="Target characters per turn")
+    p.add_argument("--max_chars_per_turn", type=int, default=8192*3, help="Maximum characters per turn")
     args = p.parse_args()
     return SerializeConfig(
         output_dir=args.output_dir,
-        target_chars_per_conversation=args.target_chars_per_conversation,
-        target_chars_per_turn=args.target_chars_per_turn,
+        max_chars_per_conversation=args.max_chars_per_conversation,
+        max_chars_per_turn=args.max_chars_per_turn,
         min_conversation_turns=args.min_conversation_turns,
         max_docs=args.max_docs,
         csv_root=(args.csv_root if args.csv_root else None),

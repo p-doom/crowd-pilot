@@ -24,16 +24,6 @@ _OSC_633 = "\x1b]633;"
 _OSC_0 = "\x1b]0;"
 
 
-@dataclass
-class SerializeConfig:
-    output_dir: str
-    target_chars_per_conversation: int
-    target_chars_per_turn: int
-    min_conversation_turns: int
-    max_docs: Optional[int]
-    csv_root: Optional[str]
-    val_ratio: float
-
 
 @dataclass
 class ChunkState:
