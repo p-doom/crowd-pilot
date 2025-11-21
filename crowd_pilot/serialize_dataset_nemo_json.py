@@ -52,11 +52,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     train_conversations = []
     val_conversations = []
     
-    chunk_turn_counts_all: List[int] = []
-    chunk_turn_counts_kept: List[int] = []
-    chunk_char_counts_all: List[int] = []
-    chunk_char_counts_kept: List[int] = []
-    sessions_kept = 0
+    chunk_turn_counts: List[int] = []
+    chunk_char_counts: List[int] = []
     docs_written = 0
 
     for i, (session_df, session_path) in enumerate(session_dataframes):
@@ -74,20 +71,15 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             min_conversation_turns=cfg.min_conversation_turns,
         )
 
-        assert len(conversation_chunks) >= 1, "At least one conversation chunk should be produced"
-
         # Per-chunk statistics (for reporting)
         per_chunk_turns = [len(chunk) for chunk in conversation_chunks]
         per_chunk_chars = [
             sum(len(turn.get("value", "")) for turn in chunk)
             for chunk in conversation_chunks
         ]
-        chunk_turn_counts_all.extend(per_chunk_turns)
-        chunk_char_counts_all.extend(per_chunk_chars)
         
-        chunk_turn_counts_kept.extend(per_chunk_turns)
-        chunk_char_counts_kept.extend(per_chunk_chars)
-        sessions_kept += 1
+        chunk_turn_counts.extend(per_chunk_turns)
+        chunk_char_counts.extend(per_chunk_chars)
 
         for chunk in conversation_chunks:
             if cfg.max_docs and docs_written >= cfg.max_docs:
@@ -166,14 +158,11 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             f"min_chars={stats['min']}, max_chars={stats['max']}"
         )
 
-    _print_turn_stats("all", chunk_turn_counts_all)
-    _print_turn_stats("kept", chunk_turn_counts_kept)
-    _print_char_stats("all", chunk_char_counts_all)
-    _print_char_stats("kept", chunk_char_counts_kept)
+    _print_turn_stats("kept", chunk_turn_counts)
+    _print_char_stats("kept", chunk_char_counts)
 
     print(f"\n[summary]")
     print(f"  Total sessions processed: {total_sessions}")
-    print(f"  Sessions kept: {sessions_kept}")
     print(f"  Train conversations: {len(train_conversations)}")
     print(f"  Val conversations: {len(val_conversations)}")
     print(f"  Output: {cfg.output_dir}/{{train,val}}.jsonl")
@@ -190,19 +179,12 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         },
         "counts": {
             "total_sessions": total_sessions,
-            "sessions_kept": sessions_kept,
             "train_conversations": len(train_conversations),
             "val_conversations": len(val_conversations),
             "docs_written": docs_written,
         },
-        "chunk_turn_stats": {
-            "all": _compute_stats(chunk_turn_counts_all),
-            "kept": _compute_stats(chunk_turn_counts_kept),
-        },
-        "chunk_char_stats": {
-            "all": _compute_stats(chunk_char_counts_all),
-            "kept": _compute_stats(chunk_char_counts_kept),
-        },
+        "chunk_turn_stats": _compute_stats(chunk_turn_counts),
+        "chunk_char_stats": _compute_stats(chunk_char_counts),
         "files": {
             "train_path": str(train_path),
             "val_path": str(val_path),
