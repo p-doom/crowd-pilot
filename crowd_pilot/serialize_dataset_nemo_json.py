@@ -69,7 +69,7 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     conversations_written = 0
 
     for i, (session_df, _) in enumerate(session_dataframes):
-        conversations = session_to_nemo_conversation_chunks(
+        conversations = session_to_nemo_conversations(
             session_df,
             cfg.max_chars_per_conversation,
             max_chars_per_turn=cfg.max_chars_per_turn,

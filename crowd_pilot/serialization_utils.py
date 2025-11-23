@@ -26,40 +26,40 @@ _OSC_0 = "\x1b]0;"
 
 
 @dataclass
-class ChunkState:
+class ConversationState:
     """
-    Mutable state used while constructing conversation chunks.
+    Mutable state used while constructing conversations.
     """
-    chunks: List[List[Dict[str, str]]]
+    conversations: List[List[Dict[str, str]]]
     max_chars_per_conversation: int
     max_chars_per_turn: int
     min_conversation_turns: int
-    current_chunk: List[Dict[str, str]] = field(default_factory=list)
+    current_conversation: List[Dict[str, str]] = field(default_factory=list)
     current_chars: int = 0
-    files_opened_in_chunk: set[str] = field(default_factory=set)
+    files_opened_in_conversation: set[str] = field(default_factory=set)
 
-    def start_new_chunk(self) -> None:
-        if self.current_chunk:
-            if len(self.current_chunk) >= self.min_conversation_turns:
-                self.chunks.append(self.current_chunk)
-        self.current_chunk = []
+    def start_new_conversation(self) -> None:
+        if self.current_conversation:
+            if len(self.current_conversation) >= self.min_conversation_turns:
+                self.conversations.append(self.current_conversation)
+        self.current_conversation = []
         self.current_chars = 0
-        self.files_opened_in_chunk.clear()
+        self.files_opened_in_conversation.clear()
 
     def append_turn(self, turn: Dict[str, str]) -> None:
         value = turn.get("value", "")
         # Enforce a per-turn character budget to prevent pathological single
-        # turns (e.g., massive file dumps) from creating multi-megabyte chunks.
+        # turns (e.g., massive file dumps) from creating multi-megabyte conversations.
         if len(value) > self.max_chars_per_turn:
             value = value[: self.max_chars_per_turn]
             turn["value"] = value
         turn_len = len(value)
         if (
-            self.current_chunk  # only start a new chunk on non-empty current chunk
+            self.current_conversation  # only start a new conversation on non-empty current conversation
             and self.current_chars + turn_len > self.max_chars_per_conversation
         ):
-            self.start_new_chunk()
-        self.current_chunk.append(turn)
+            self.start_new_conversation()
+        self.current_conversation.append(turn)
         self.current_chars += turn_len
 
     def maybe_capture_file_contents(
@@ -68,9 +68,9 @@ class ChunkState:
         content: str,
     ) -> None:
         """
-        Capture the contents of the given file in the current chunk if it hasn't been opened yet.
+        Capture the contents of the given file in the current conversation if it hasn't been opened yet.
         """
-        if file_path in self.files_opened_in_chunk:
+        if file_path in self.files_opened_in_conversation:
             return
         cmd = f"cat -n {file_path}"
         self.append_turn({
@@ -82,7 +82,7 @@ class ChunkState:
             "from": "User",
             "value": f"<stdout>\n{output}\n</stdout>",
         })
-        self.files_opened_in_chunk.add(file_path)
+        self.files_opened_in_conversation.add(file_path)
 
 
 def _clean_text(text: str) -> str:
@@ -133,7 +133,7 @@ def _normalize_terminal_output(raw: str) -> str:
     # Fallback: drop any unterminated OSC up to end-of-line only
     s = "\n".join(_ANSI_OSC_LINE_FALLBACK_RE.sub("", line) for line in s.split("\n"))
     # Resolve carriage returns per line:
-    # - If there are multiple rewrites, keep the last non-empty chunk
+    # - If there are multiple rewrites, keep the last non-empty conversation
     # - If it's CRLF (ending with '\r' before '\n'), keep the content before '\r'
     resolved_lines: List[str] = []
     for seg in s.split("\n"):
@@ -211,7 +211,7 @@ def _compute_changed_block_lines(
     return (start_before, end_before, start_after, end_after, replacement_lines)
 
 
-def session_to_nemo_conversation_chunks(
+def session_to_nemo_conversations(
     df: pd.DataFrame,
     max_chars_per_conversation: int,
     max_chars_per_turn: int,
@@ -221,20 +221,20 @@ def session_to_nemo_conversation_chunks(
     coalesce_radius: int = 5,
 ) -> List[List[Dict[str, str]]]:
     """
-    Convert a session DataFrame to one or more NeMo conversation chunks.
+    Convert a session DataFrame to one or more NeMo conversations.
 
-    - Chunks are created by approximately limiting the total characters
+    - Conversations are created by approximately limiting the total characters
       across all `value` fields to `max_chars_per_conversation`.
-    - When a new chunk starts (after the first), the first time a file is
-      referenced in that chunk we re-log the full file contents with
-      `cat -n <file>` and numbered output so that each chunk is self-contained.
+    - When a new conversation starts (after the first), the first time a file is
+      referenced in that conversation we re-log the full file contents with
+      `cat -n <file>` and numbered output so that each conversation is self-contained.
     """
     file_states: Dict[str, str] = {}
     per_file_viewport: Dict[str, Optional[Tuple[int, int]]] = {}
 
-    chunks: List[List[Dict[str, str]]] = []
-    chunk_state = ChunkState(
-        chunks=chunks,
+    conversations: List[List[Dict[str, str]]] = []
+    conversation_state = ConversationState(
+        conversations=conversations,
         max_chars_per_conversation=max_chars_per_conversation,
         max_chars_per_turn=max_chars_per_turn,
         min_conversation_turns=min_conversation_turns,
@@ -253,7 +253,7 @@ def session_to_nemo_conversation_chunks(
             out = _normalize_terminal_output(out)
         cleaned = _clean_text(out)
         if cleaned.strip():
-            chunk_state.append_turn({
+            conversation_state.append_turn({
                 "from": "User",
                 "value": f"<stdout>\n{cleaned}\n</stdout>",
             })
@@ -294,14 +294,14 @@ def session_to_nemo_conversation_chunks(
         vp = _compute_viewport(total_lines, center, viewport_radius)
         per_file_viewport[target_file] = vp
         vstart, vend = vp
-        chunk_state.maybe_capture_file_contents(target_file, before_snapshot)
+        conversation_state.maybe_capture_file_contents(target_file, before_snapshot)
         chained_cmd = f"{sed_cmd} && cat -n {target_file} | sed -n '{vstart},{vend}p'"
-        chunk_state.append_turn({
+        conversation_state.append_turn({
             "from": "Assistant",
             "value": _fenced_block("bash", _clean_text(chained_cmd)),
         })
         viewport_output = _line_numbered_output(after_state, vstart, vend)
-        chunk_state.append_turn({
+        conversation_state.append_turn({
             "from": "User",
             "value": f"<stdout>\n{viewport_output}\n</stdout>",
         })
@@ -326,16 +326,16 @@ def session_to_nemo_conversation_chunks(
                     content = str(text).replace("\\n", "\n").replace("\\r", "\r")
                     file_states[file_path] = content
                     cmd = f"cat -n {file_path}"
-                    chunk_state.append_turn({
+                    conversation_state.append_turn({
                         "from": "Assistant",
                         "value": _fenced_block("bash", _clean_text(cmd)),
                     })
                     output = _line_numbered_output(content)
-                    chunk_state.append_turn({
+                    conversation_state.append_turn({
                         "from": "User",
                         "value": f"<stdout>\n{output}\n</stdout>",
                     })
-                    chunk_state.files_opened_in_chunk.add(file_path)
+                    conversation_state.files_opened_in_conversation.add(file_path)
                 else:
                     # File switch without content snapshot: show current viewport only
                     content = file_states.get(file_path, "")
@@ -346,14 +346,14 @@ def session_to_nemo_conversation_chunks(
                         per_file_viewport[file_path] = vp
                     if vp:
                         vstart, vend = vp
-                        chunk_state.maybe_capture_file_contents(file_path, content)
+                        conversation_state.maybe_capture_file_contents(file_path, content)
                         cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                        chunk_state.append_turn({
+                        conversation_state.append_turn({
                             "from": "Assistant",
                             "value": _fenced_block("bash", _clean_text(cmd)),
                         })
                         viewport_output = _line_numbered_output(content, vstart, vend)
-                        chunk_state.append_turn({
+                        conversation_state.append_turn({
                             "from": "User",
                             "value": f"<stdout>\n{viewport_output}\n</stdout>",
                         })
@@ -367,9 +367,9 @@ def session_to_nemo_conversation_chunks(
                 # Approximate current edit region in line space
                 new_text_str = str(new_text) if pd.notna(new_text) else ""
                 start_line_current = before[:offset].count("\n") + 1
-                deleted_chunk = before[offset:offset + length]
+                deleted_conversation = before[offset:offset + length]
                 lines_added = new_text_str.count("\n")
-                lines_deleted = deleted_chunk.count("\n")
+                lines_deleted = deleted_conversation.count("\n")
                 region_start = start_line_current
                 region_end = start_line_current + max(lines_added, lines_deleted, 0)
                 # Flush pending edits if this edit is far from the pending region
@@ -415,14 +415,14 @@ def session_to_nemo_conversation_chunks(
                         should_emit = True
                 if should_emit and vp:
                     vstart, vend = vp
-                    chunk_state.maybe_capture_file_contents(file_path, content)
+                    conversation_state.maybe_capture_file_contents(file_path, content)
                     cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                    chunk_state.append_turn({
+                    conversation_state.append_turn({
                         "from": "Assistant",
                         "value": _fenced_block("bash", _clean_text(cmd)),
                     })
                     viewport_output = _line_numbered_output(content, vstart, vend)
-                    chunk_state.append_turn({
+                    conversation_state.append_turn({
                         "from": "User",
                         "value": f"<stdout>\n{viewport_output}\n</stdout>",
                     })
@@ -432,7 +432,7 @@ def session_to_nemo_conversation_chunks(
                 _flush_terminal_output_buffer()
                 command = row["Text"]
                 command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
-                chunk_state.append_turn({
+                conversation_state.append_turn({
                     "from": "Assistant",
                     "value": _fenced_block("bash", _clean_text(command_str)),
                 })
@@ -462,7 +462,7 @@ def session_to_nemo_conversation_chunks(
                 if re.search(r"[^A-Za-z0-9._/\\-]", branch_name):
                     branch_name = "'" + branch_name.replace("'", "'\"'\"'") + "'"
                 cmd = f"git checkout {branch_name}"
-                chunk_state.append_turn({
+                conversation_state.append_turn({
                     "from": "Assistant",
                     "value": _fenced_block("bash", _clean_text(cmd)),
                 })
@@ -472,10 +472,10 @@ def session_to_nemo_conversation_chunks(
 
     _flush_all_pending_edits()
     _flush_terminal_output_buffer()
-    if chunk_state.current_chunk:
-        if len(chunk_state.current_chunk) >= min_conversation_turns:
-            chunks.append(chunk_state.current_chunk)
-    return chunks
+    if conversation_state.current_conversation:
+        if len(conversation_state.current_conversation) >= min_conversation_turns:
+            conversations.append(conversation_state.current_conversation)
+    return conversations
 
 
 
