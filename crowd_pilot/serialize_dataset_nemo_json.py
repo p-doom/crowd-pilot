@@ -66,7 +66,7 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     char_counts: List[int] = []
     docs_written = 0
 
-    for i, (session_df, session_path) in enumerate(session_dataframes):
+    for i, (session_df, _) in enumerate(session_dataframes):
         if cfg.max_docs and docs_written >= cfg.max_docs:
             break
             
