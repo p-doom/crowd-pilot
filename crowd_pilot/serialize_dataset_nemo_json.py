@@ -69,8 +69,8 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     train_conversations = []
     val_conversations = []
     
-    turn_counts: List[int] = []
-    char_counts: List[int] = []
+    message_counts: List[int] = []
+    token_counts: List[int] = []
     conversations_written = 0
 
     for i, (session_df, _) in enumerate(session_dataframes):
@@ -83,14 +83,15 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         )
 
         # Per-conversation statistics (for reporting)
-        per_conversation_turns = [len(conversation) for conversation in conversations]
-        per_conversation_chars = [
-            sum(len(turn.get("value", "")) for turn in conversation)
+        per_conversation_messages = [len(conversation) for conversation in conversations]
+        per_conversation_tokens = [
+            # FIXME (f.srambical): this is highly inefficient
+            sum(len(tokenizer.encode(turn.get("value", ""))) for turn in conversation)
             for conversation in conversations
         ]
         
-        turn_counts.extend(per_conversation_turns)
-        char_counts.extend(per_conversation_chars)
+        message_counts.extend(per_conversation_messages)
+        token_counts.extend(per_conversation_tokens)
 
         for conversation in conversations:
             record = {
@@ -116,34 +117,15 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         for record in val_conversations:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
-    def _compute_stats(values: List[int]) -> dict | None:
-        if not values:
-            return None
-        count = len(values)
-        total = sum(values)
-        avg = total / count if count > 0 else 0.0
-        sorted_vals = sorted(values)
-        mid = count // 2
-        if count % 2 == 1:
-            median = float(sorted_vals[mid])
-        else:
-            median = 0.5 * (sorted_vals[mid - 1] + sorted_vals[mid])
-        min_len = min(values)
-        max_len = max(values)
-        return {
-            "count": count,
-            "total": total,
-            "median": median,
-            "avg": avg,
-            "min": min_len,
-            "max": max_len,
-        }
-
     print(f"\n[summary]")
     print(f"  Total sessions processed: {total_sessions}")
     print(f"  Train conversations: {len(train_conversations)}")
     print(f"  Val conversations: {len(val_conversations)}")
     print(f"  Output: {cfg.output_dir}/{{training,validation}}.jsonl")
+
+    total_messages = sum(message_counts)
+    total_tokens = sum(token_counts)
+    count = len(message_counts)
 
     metadata = {
         "config": {
@@ -161,8 +143,20 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             "val_conversations": len(val_conversations),
             "conversations_written": conversations_written,
         },
-        "turn_stats": _compute_stats(turn_counts),
-        "char_stats": _compute_stats(char_counts),
+        "stats": {
+            "messages": {
+                "total": total_messages,
+                "avg": total_messages / count if count > 0 else 0,
+                "min": min(message_counts) if message_counts else 0,
+                "max": max(message_counts) if message_counts else 0,
+            },
+            "tokens": {
+                "total": total_tokens,
+                "avg": total_tokens / count if count > 0 else 0,
+                "min": min(token_counts) if token_counts else 0,
+                "max": max(token_counts) if token_counts else 0,
+            },
+        },
         "files": {
             "train_path": str(train_path),
             "val_path": str(val_path),
