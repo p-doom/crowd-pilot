@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 
 import difflib
 import re
@@ -31,36 +31,48 @@ class ConversationState:
     Mutable state used while constructing conversations.
     """
     conversations: List[List[Dict[str, str]]]
-    max_chars_per_conversation: int
-    max_chars_per_turn: int
-    min_conversation_turns: int
+    max_tokens_per_conversation: int
+    max_tokens_per_message: int
+    min_conversation_messages: int
+    tokenizer: Any
     current_conversation: List[Dict[str, str]] = field(default_factory=list)
-    current_chars: int = 0
+    current_tokens: int = 0
     files_opened_in_conversation: set[str] = field(default_factory=set)
 
-    def start_new_conversation(self) -> None:
+    def finalize_conversation(self) -> None:
+        """
+        Finalize the current conversation: check constraints and append if valid.
+        Then reset state for the next conversation.
+        """
         if self.current_conversation:
-            if len(self.current_conversation) >= self.min_conversation_turns:
+            is_long_enough = len(self.current_conversation) >= self.min_conversation_messages
+            has_user = any(msg.get("from") == "User" for msg in self.current_conversation)
+            has_assistant = any(msg.get("from") == "Assistant" for msg in self.current_conversation)
+
+            if is_long_enough and has_user and has_assistant:
                 self.conversations.append(self.current_conversation)
+        
         self.current_conversation = []
-        self.current_chars = 0
+        self.current_tokens = 0
         self.files_opened_in_conversation.clear()
 
-    def append_turn(self, turn: Dict[str, str]) -> None:
-        value = turn.get("value", "")
-        # Enforce a per-turn character budget to prevent pathological single
-        # turns (e.g., massive file dumps) from creating multi-megabyte conversations.
-        if len(value) > self.max_chars_per_turn:
-            value = value[: self.max_chars_per_turn]
-            turn["value"] = value
-        turn_len = len(value)
-        if (
-            self.current_conversation  # only start a new conversation on non-empty current conversation
-            and self.current_chars + turn_len > self.max_chars_per_conversation
-        ):
-            self.start_new_conversation()
-        self.current_conversation.append(turn)
-        self.current_chars += turn_len
+    def append_message(self, message: Dict[str, str]) -> None:
+        value = message["value"]
+        
+        tokens = self.tokenizer.encode(value)
+        num_tokens = len(tokens)
+
+        if num_tokens > self.max_tokens_per_message:
+            tokens = tokens[:self.max_tokens_per_message]
+            value = self.tokenizer.decode(tokens)
+            message["value"] = value
+            num_tokens = self.max_tokens_per_message
+
+        if self.current_tokens + num_tokens > self.max_tokens_per_conversation:
+            self.finalize_conversation()
+
+        self.current_conversation.append(message)
+        self.current_tokens += num_tokens
 
     def maybe_capture_file_contents(
         self,
@@ -73,12 +85,12 @@ class ConversationState:
         if file_path in self.files_opened_in_conversation:
             return
         cmd = f"cat -n {file_path}"
-        self.append_turn({
+        self.append_message({
             "from": "Assistant",
             "value": _fenced_block("bash", _clean_text(cmd)),
         })
         output = _line_numbered_output(content)
-        self.append_turn({
+        self.append_message({
             "from": "User",
             "value": f"<stdout>\n{output}\n</stdout>",
         })
@@ -213,9 +225,10 @@ def _compute_changed_block_lines(
 
 def session_to_nemo_conversations(
     df: pd.DataFrame,
-    max_chars_per_conversation: int,
-    max_chars_per_turn: int,
-    min_conversation_turns: int,
+    max_tokens_per_conversation: int,
+    max_tokens_per_message: int,
+    min_conversation_messages: int,
+    tokenizer: Any,
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
     coalesce_radius: int = 5,
@@ -223,8 +236,8 @@ def session_to_nemo_conversations(
     """
     Convert a session DataFrame to one or more NeMo conversations.
 
-    - Conversations are created by approximately limiting the total characters
-      across all `value` fields to `max_chars_per_conversation`.
+    - Conversations are created by approximately limiting the total tokens
+      across all `value` fields to `max_tokens_per_conversation`.
     - When a new conversation starts (after the first), the first time a file is
       referenced in that conversation we re-log the full file contents with
       `cat -n <file>` and numbered output so that each conversation is self-contained.
@@ -235,9 +248,10 @@ def session_to_nemo_conversations(
     conversations: List[List[Dict[str, str]]] = []
     conversation_state = ConversationState(
         conversations=conversations,
-        max_chars_per_conversation=max_chars_per_conversation,
-        max_chars_per_turn=max_chars_per_turn,
-        min_conversation_turns=min_conversation_turns,
+        max_tokens_per_conversation=max_tokens_per_conversation,
+        max_tokens_per_message=max_tokens_per_message,
+        min_conversation_messages=min_conversation_messages,
+        tokenizer=tokenizer,
     )
 
     terminal_output_buffer: List[str] = []
@@ -253,7 +267,7 @@ def session_to_nemo_conversations(
             out = _normalize_terminal_output(out)
         cleaned = _clean_text(out)
         if cleaned.strip():
-            conversation_state.append_turn({
+            conversation_state.append_message({
                 "from": "User",
                 "value": f"<stdout>\n{cleaned}\n</stdout>",
             })
@@ -296,12 +310,12 @@ def session_to_nemo_conversations(
         vstart, vend = vp
         conversation_state.maybe_capture_file_contents(target_file, before_snapshot)
         chained_cmd = f"{sed_cmd} && cat -n {target_file} | sed -n '{vstart},{vend}p'"
-        conversation_state.append_turn({
+        conversation_state.append_message({
             "from": "Assistant",
             "value": _fenced_block("bash", _clean_text(chained_cmd)),
         })
         viewport_output = _line_numbered_output(after_state, vstart, vend)
-        conversation_state.append_turn({
+        conversation_state.append_message({
             "from": "User",
             "value": f"<stdout>\n{viewport_output}\n</stdout>",
         })
@@ -326,12 +340,12 @@ def session_to_nemo_conversations(
                     content = str(text).replace("\\n", "\n").replace("\\r", "\r")
                     file_states[file_path] = content
                     cmd = f"cat -n {file_path}"
-                    conversation_state.append_turn({
+                    conversation_state.append_message({
                         "from": "Assistant",
                         "value": _fenced_block("bash", _clean_text(cmd)),
                     })
                     output = _line_numbered_output(content)
-                    conversation_state.append_turn({
+                    conversation_state.append_message({
                         "from": "User",
                         "value": f"<stdout>\n{output}\n</stdout>",
                     })
@@ -348,12 +362,12 @@ def session_to_nemo_conversations(
                         vstart, vend = vp
                         conversation_state.maybe_capture_file_contents(file_path, content)
                         cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                        conversation_state.append_turn({
+                        conversation_state.append_message({
                             "from": "Assistant",
                             "value": _fenced_block("bash", _clean_text(cmd)),
                         })
                         viewport_output = _line_numbered_output(content, vstart, vend)
-                        conversation_state.append_turn({
+                        conversation_state.append_message({
                             "from": "User",
                             "value": f"<stdout>\n{viewport_output}\n</stdout>",
                         })
@@ -417,12 +431,12 @@ def session_to_nemo_conversations(
                     vstart, vend = vp
                     conversation_state.maybe_capture_file_contents(file_path, content)
                     cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
-                    conversation_state.append_turn({
+                    conversation_state.append_message({
                         "from": "Assistant",
                         "value": _fenced_block("bash", _clean_text(cmd)),
                     })
                     viewport_output = _line_numbered_output(content, vstart, vend)
-                    conversation_state.append_turn({
+                    conversation_state.append_message({
                         "from": "User",
                         "value": f"<stdout>\n{viewport_output}\n</stdout>",
                     })
@@ -432,7 +446,7 @@ def session_to_nemo_conversations(
                 _flush_terminal_output_buffer()
                 command = row["Text"]
                 command_str = str(command).replace("\\n", "\n").replace("\\r", "\r")
-                conversation_state.append_turn({
+                conversation_state.append_message({
                     "from": "Assistant",
                     "value": _fenced_block("bash", _clean_text(command_str)),
                 })
@@ -462,7 +476,7 @@ def session_to_nemo_conversations(
                 if re.search(r"[^A-Za-z0-9._/\\-]", branch_name):
                     branch_name = "'" + branch_name.replace("'", "'\"'\"'") + "'"
                 cmd = f"git checkout {branch_name}"
-                conversation_state.append_turn({
+                conversation_state.append_message({
                     "from": "Assistant",
                     "value": _fenced_block("bash", _clean_text(cmd)),
                 })
@@ -472,9 +486,7 @@ def session_to_nemo_conversations(
 
     _flush_all_pending_edits()
     _flush_terminal_output_buffer()
-    if conversation_state.current_conversation:
-        if len(conversation_state.current_conversation) >= min_conversation_turns:
-            conversations.append(conversation_state.current_conversation)
+    conversation_state.finalize_conversation()
     return conversations
 
 

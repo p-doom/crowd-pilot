@@ -18,28 +18,33 @@ from typing import List, Tuple, cast, Optional
 from dataclasses import dataclass
 
 import pandas as pd
+from transformers import AutoTokenizer
 
 from serialization_utils import (
-    session_to_nemo_conversation_chunks,
+    session_to_nemo_conversations,
     _discover_local_sessions,
 )
 
 @dataclass
 class SerializeConfig:
     output_dir: str
-    max_chars_per_conversation: int
-    max_chars_per_turn: int
-    min_conversation_turns: int
+    max_tokens_per_conversation: int
+    max_tokens_per_message: int
+    min_conversation_messages: int
     csv_root: Optional[str]
     val_ratio: float
+    tokenizer_model: str
 
 
 def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     """Convert CSV sessions to NeMo JSONL format."""
-    assert cfg.max_chars_per_conversation > 0, "max_chars_per_conversation must be positive"
-    assert cfg.max_chars_per_turn > 0, "max_chars_per_turn must be positive"
-    assert cfg.min_conversation_turns > 0, "min_conversation_turns must be positive"
+    assert cfg.max_tokens_per_conversation > 0, "max_tokens_per_conversation must be positive"
+    assert cfg.max_tokens_per_message > 0, "max_tokens_per_message must be positive"
+    assert cfg.min_conversation_messages > 0, "min_conversation_messages must be positive"
     os.makedirs(cfg.output_dir, exist_ok=True)
+    
+    print(f"Loading tokenizer from {cfg.tokenizer_model}...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_model)
 
     required_cols = ["Sequence", "Time", "File", "RangeOffset", "RangeLength", "Text", "Language", "Type"]
 
@@ -71,9 +76,10 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     for i, (session_df, _) in enumerate(session_dataframes):
         conversations = session_to_nemo_conversations(
             session_df,
-            cfg.max_chars_per_conversation,
-            max_chars_per_turn=cfg.max_chars_per_turn,
-            min_conversation_turns=cfg.min_conversation_turns,
+            cfg.max_tokens_per_conversation,
+            max_tokens_per_message=cfg.max_tokens_per_message,
+            min_conversation_messages=cfg.min_conversation_messages,
+            tokenizer=tokenizer,
         )
 
         # Per-conversation statistics (for reporting)
@@ -143,10 +149,11 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
         "config": {
             "csv_root": cfg.csv_root,
             "output_dir": cfg.output_dir,
-            "min_conversation_turns": cfg.min_conversation_turns,
+            "min_conversation_messages": cfg.min_conversation_messages,
             "val_ratio": cfg.val_ratio,
-            "max_chars_per_conversation": cfg.max_chars_per_conversation,
-            "max_chars_per_turn": cfg.max_chars_per_turn,
+            "max_tokens_per_conversation": cfg.max_tokens_per_conversation,
+            "max_tokens_per_message": cfg.max_tokens_per_message,
+            "tokenizer_model": cfg.tokenizer_model,
         },
         "counts": {
             "total_sessions": total_sessions,
@@ -175,27 +182,30 @@ def parse_args() -> SerializeConfig:
                    help="Root directory containing per-session CSV files")
     p.add_argument("--output_dir", type=str, required=True, 
                    help="Output directory for JSONL files")
-    p.add_argument("--min_conversation_turns", type=int, default=5, 
-                   help="Minimum number of turns to keep a conversation chunk")
+    p.add_argument("--min_conversation_messages", type=int, default=5, 
+                   help="Minimum number of messages to keep a conversation chunk")
     p.add_argument("--max_conversations", type=int, default=None, 
                    help="Stop after writing this many conversations")
     p.add_argument("--val_ratio", type=float, default=0.10, 
                    help="Fraction of sessions to route to validation [0,1)")
     p.add_argument(
-        "--max_chars_per_conversation",
+        "--max_tokens_per_conversation",
         type=int,
-        default=8192*16*3,
-        help="Maximum characters per conversation chunk",
+        default=8192,
+        help="Maximum tokens per conversation chunk",
     )
-    p.add_argument("--max_chars_per_turn", type=int, default=8192*3, help="Maximum characters per turn")
+    p.add_argument("--max_tokens_per_message", type=int, default=2048, help="Maximum tokens per message")
+    p.add_argument("--tokenizer_model", type=str, required=True, help="Path or name of the HuggingFace tokenizer model")
+    
     args = p.parse_args()
     return SerializeConfig(
         output_dir=args.output_dir,
-        max_chars_per_conversation=args.max_chars_per_conversation,
-        max_chars_per_turn=args.max_chars_per_turn,
-        min_conversation_turns=args.min_conversation_turns,
+        max_tokens_per_conversation=args.max_tokens_per_conversation,
+        max_tokens_per_message=args.max_tokens_per_message,
+        min_conversation_messages=args.min_conversation_messages,
         csv_root=(args.csv_root if args.csv_root else None),
         val_ratio=args.val_ratio,
+        tokenizer_model=args.tokenizer_model,
     )
 
 
