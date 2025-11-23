@@ -24,16 +24,6 @@ _OSC_633 = "\x1b]633;"
 _OSC_0 = "\x1b]0;"
 
 
-@dataclass
-class SerializeConfig:
-    output_dir: str
-    target_chars_per_conversation: int
-    target_chars_per_turn: int
-    min_session_turns: int
-    max_docs: Optional[int]
-    csv_root: Optional[str]
-    val_ratio: float
-
 
 @dataclass
 class ChunkState:
@@ -43,13 +33,15 @@ class ChunkState:
     chunks: List[List[Dict[str, str]]]
     max_chars_per_conversation: int
     max_chars_per_turn: int
+    min_conversation_turns: int
     current_chunk: List[Dict[str, str]] = field(default_factory=list)
     current_chars: int = 0
     files_opened_in_chunk: set[str] = field(default_factory=set)
 
     def start_new_chunk(self) -> None:
         if self.current_chunk:
-            self.chunks.append(self.current_chunk)
+            if len(self.current_chunk) >= self.min_conversation_turns:
+                self.chunks.append(self.current_chunk)
         self.current_chunk = []
         self.current_chars = 0
         self.files_opened_in_chunk.clear()
@@ -223,6 +215,7 @@ def session_to_nemo_conversation_chunks(
     df: pd.DataFrame,
     max_chars_per_conversation: int,
     max_chars_per_turn: int,
+    min_conversation_turns: int,
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
     coalesce_radius: int = 5,
@@ -244,6 +237,7 @@ def session_to_nemo_conversation_chunks(
         chunks=chunks,
         max_chars_per_conversation=max_chars_per_conversation,
         max_chars_per_turn=max_chars_per_turn,
+        min_conversation_turns=min_conversation_turns,
     )
 
     terminal_output_buffer: List[str] = []
@@ -479,7 +473,8 @@ def session_to_nemo_conversation_chunks(
     _flush_all_pending_edits()
     _flush_terminal_output_buffer()
     if chunk_state.current_chunk:
-        chunks.append(chunk_state.current_chunk)
+        if len(chunk_state.current_chunk) >= min_conversation_turns:
+            chunks.append(chunk_state.current_chunk)
     return chunks
 
 
