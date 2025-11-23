@@ -133,30 +133,6 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
             "max": max_len,
         }
 
-    def _print_turn_stats(label: str, values: List[int]) -> None:
-        if not values:
-            print(f"[debug] No {label} chunks for turn count stats.")
-            return
-        stats = _compute_stats(values)
-        assert stats is not None
-        print(
-            f"[debug] {label.capitalize()} chunks turn stats: "
-            f"count={stats['count']}, median_turns={stats['median']:.1f}, avg_turns={stats['avg']:.1f}, "
-            f"min_turns={stats['min']}, max_turns={stats['max']}"
-        )
-
-    def _print_char_stats(label: str, values: List[int]) -> None:
-        if not values:
-            print(f"[debug] No {label} chunks for character stats.")
-            return
-        stats = _compute_stats(values)
-        assert stats is not None
-        print(
-            f"[debug] {label.capitalize()} chunks char stats: "
-            f"count={stats['count']}, median_chars={stats['median']:.1f}, avg_chars={stats['avg']:.1f}, "
-            f"min_chars={stats['min']}, max_chars={stats['max']}"
-        )
-
     print(f"\n[summary]")
     print(f"  Total sessions processed: {total_sessions}")
     print(f"  Train conversations: {len(train_conversations)}")
