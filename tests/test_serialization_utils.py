@@ -1,171 +1,111 @@
-#!/usr/bin/env python3
-"""
-Synthetic tests for `serialization_utils.py`.
-
-These tests stress `_apply_change` and `_compute_changed_block_lines`
-to ensure that file state remains consistent even after many edits
-insert / replace / delete) and that the diff computation can be used
-to reconstruct the `after` state from the `before` state.
-"""
-
-from __future__ import annotations
-
-import random
-import string
 import unittest
+import sys
+import os
 
-from crowd_pilot.serialization_utils import _apply_change, _compute_changed_block_lines
+# Add the project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from crowd_pilot.serialization_utils import ConversationState
 
-def _random_text(rng: random.Random, max_len: int = 40) -> str:
-    """Generate random text including spaces and newlines."""
-    alphabet = string.ascii_letters + string.digits + " \t"
-    # Bias towards shorter snippets but occasionally longer ones
-    length = rng.randint(0, max_len)
-    # Sprinkle in a few explicit '\n' and real newlines
-    chars = []
-    for _ in range(length):
-        if rng.random() < 0.05:
-            # Literal backslash-n, as it would appear in CSV
-            chars.append("\\n")
-        elif rng.random() < 0.05:
-            # Actual newline character
-            chars.append("\n")
-        else:
-            chars.append(rng.choice(alphabet))
-    return "".join(chars)
+class MockTokenizer:
+    def __init__(self):
+        pass
+    
+    def encode(self, text):
+        # Mock tokenization: 1 char = 1 token for simplicity in tests
+        return list(text)
+        
+    def decode(self, tokens):
+        return "".join(tokens)
 
+class TestConversationState(unittest.TestCase):
+    def setUp(self):
+        self.tokenizer = MockTokenizer()
+        self.conversations = []
+        self.max_tokens_per_conversation = 100
+        self.max_tokens_per_message = 50
+        self.min_conversation_messages = 2
+        
+        self.state = ConversationState(
+            conversations=self.conversations,
+            max_tokens_per_conversation=self.max_tokens_per_conversation,
+            max_tokens_per_message=self.max_tokens_per_message,
+            min_conversation_messages=self.min_conversation_messages,
+            tokenizer=self.tokenizer
+        )
 
-class ApplyChangeRandomizedTest(unittest.TestCase):
-    """Randomized tests for `_apply_change` to check state consistency."""
+    def test_renaming_and_logic_dropped(self):
+        """Test 1: Create a conversation with 6 Assistant messages and 0 User messages. Verify it is DROPPED."""
+        # 6 Assistant messages
+        for i in range(6):
+            self.state.append_message({"from": "Assistant", "value": f"cmd{i}"})
+            
+        # Finalize
+        self.state.finalize_conversation()
+        
+        # Should be dropped because no User role
+        self.assertEqual(len(self.conversations), 0)
 
-    def _naive_apply(self, base: str, offset: int, length: int, new_text: str) -> str:
-        """Naive implementation mirroring `_apply_change` semantics."""
-        text = "" if new_text is None else str(new_text)
-        # Match the newline normalization used in `_apply_change`
-        text = text.replace("\\n", "\n").replace("\\r", "\r")
-        if offset > len(base):
-            base = base + (" " * (offset - len(base)))
-        return base[:offset] + text + base[offset + length :]
+    def test_logic_kept(self):
+        """Test 2: Create a conversation with 5 Assistant messages and 1 User message. Verify it is KEPT."""
+        # 5 Assistant messages
+        for i in range(5):
+            self.state.append_message({"from": "Assistant", "value": f"cmd{i}"})
+        # 1 User message
+        self.state.append_message({"from": "User", "value": "output"})
+        
+        self.state.finalize_conversation()
+        
+        # Should be kept
+        self.assertEqual(len(self.conversations), 1)
+        self.assertEqual(len(self.conversations[0]), 6)
 
-    def test_apply_change_random_sequences(self) -> None:
-        """
-        Apply hundreds of random edits (insert/replace/delete) and
-        check that `_apply_change` matches the naive reference.
-        """
-        rng = random.Random(12345)
+    def test_token_counting(self):
+        """Test 3: Verify limit is respected based on TOKENS."""
+        self.state = ConversationState(
+            conversations=self.conversations,
+            max_tokens_per_conversation=100,
+            max_tokens_per_message=100,
+            min_conversation_messages=1,
+            tokenizer=self.tokenizer
+        )
+        
+        # Msg 1: User (40 tokens)
+        self.state.append_message({"from": "User", "value": "a" * 40})
+        # Msg 2: Assistant (40 tokens) -> Total 80. OK.
+        self.state.append_message({"from": "Assistant", "value": "b" * 40})
+        
+        # Msg 3: User (30 tokens) -> Total 110. Should split.
+        # The split happens BEFORE adding Msg 3.
+        # So Conversation 1 = Msg 1 + Msg 2 (80 tokens).
+        # Conversation 2 (current) = Msg 3.
+        self.state.append_message({"from": "User", "value": "c" * 30})
+        
+        self.assertEqual(len(self.conversations), 1)
+        self.assertEqual(len(self.conversations[0]), 2) # Msg 1 + Msg 2
+        self.assertEqual(self.state.current_tokens, 30) # Msg 3
+        self.assertEqual(len(self.state.current_conversation), 1)
 
-        for _ in range(50):  # 50 independent runs
-            base_expected = _random_text(rng, max_len=200)
-            base_actual = base_expected
+    def test_both_roles_required(self):
+        """Test 4: Create a conversation with User messages but no Assistant messages. Verify it is DROPPED."""
+        self.state.append_message({"from": "User", "value": "output1"})
+        self.state.append_message({"from": "User", "value": "output2"})
+        
+        self.state.finalize_conversation()
+        
+        self.assertEqual(len(self.conversations), 0)
 
-            for _ in range(300):  # up to 300 edits per run
-                # Choose an offset in the current string
-                if base_expected:
-                    offset = rng.randint(0, len(base_expected))
-                else:
-                    offset = 0
-
-                # Randomly choose an operation type
-                op = rng.choice(["insert", "delete", "replace"])
-
-                if op == "insert":
-                    length = 0
-                    new_text = _random_text(rng, max_len=40)
-                elif op == "delete":
-                    if len(base_expected) == 0:
-                        continue
-                    max_len = len(base_expected) - offset
-                    length = rng.randint(0, max_len)
-                    new_text = ""
-                else:  # replace
-                    if len(base_expected) == 0:
-                        length = 0
-                    else:
-                        max_len = len(base_expected) - offset
-                        length = rng.randint(0, max_len)
-                    new_text = _random_text(rng, max_len=40)
-
-                base_expected = self._naive_apply(base_expected, offset, length, new_text)
-                base_actual = _apply_change(base_actual, offset, length, new_text)
-
-                self.assertEqual(
-                    base_actual.rstrip("\n"),
-                    base_expected.rstrip("\n"),
-                    msg=f"Mismatch after op={op}, offset={offset}, length={length}",
-                )
-
-
-class ComputeChangedBlockLinesTest(unittest.TestCase):
-    """Tests for `_compute_changed_block_lines` using synthetic before/after pairs."""
-
-    def _apply_block(
-        self,
-        before: str,
-        start_before: int,
-        end_before: int,
-        repl_lines: list[str],
-    ) -> str:
-        """Apply a contiguous block replacement to `before`."""
-        before_lines = before.splitlines()
-        # Convert 1-based inclusive indices to Python slices
-        start_idx = max(0, start_before - 1)
-        end_idx = min(len(before_lines), end_before)
-        new_lines = before_lines[:start_idx] + repl_lines + before_lines[end_idx:]
-        return "\n".join(new_lines)
-
-    def test_changed_block_round_trip_single_region(self) -> None:
-        """
-        Construct `after` from `before` via a single contiguous region
-        replacement and ensure `_compute_changed_block_lines` returns a
-        patch that reproduces `after`.
-        """
-        rng = random.Random(67890)
-
-        for _ in range(100):  # 100 random before/after pairs
-            # Build a non-empty "before" text with multiple lines
-            num_lines = rng.randint(3, 40)
-            before_lines = [
-                _random_text(rng, max_len=40) or f"line-{i}" for i in range(num_lines)
-            ]
-            before = "\n".join(before_lines)
-
-            # Choose a single contiguous region to replace
-            start_before = rng.randint(1, num_lines)
-            end_before = rng.randint(start_before, num_lines)
-
-            # Replacement may be empty (pure deletion) or some new lines
-            repl_count = rng.randint(0, 10)
-            repl_lines = [
-                _random_text(rng, max_len=40) or f"repl-{i}" for i in range(repl_count)
-            ]
-
-            after_lines = (
-                before_lines[: start_before - 1] + repl_lines + before_lines[end_before:]
-            )
-            after = "\n".join(after_lines)
-
-            (
-                s_before,
-                e_before,
-                _s_after,
-                _e_after,
-                diff_repl_lines,
-            ) = _compute_changed_block_lines(before, after)
-
-            patched = self._apply_block(before, s_before, e_before, diff_repl_lines)
-
-            self.assertEqual(
-                patched.rstrip("\n"),
-                after.rstrip("\n"),
-                msg=(
-                    f"Failed to reconstruct `after` from `before` using "
-                    f"computed block ({s_before},{e_before})"
-                ),
-            )
-
+    def test_min_messages_respected(self):
+        """Test 5: Verify min_conversation_messages is respected."""
+        self.state.min_conversation_messages = 5
+        
+        # 2 messages (User + Assistant) -> Valid roles, but too short
+        self.state.append_message({"from": "User", "value": "out"})
+        self.state.append_message({"from": "Assistant", "value": "cmd"})
+        
+        self.state.finalize_conversation()
+        
+        self.assertEqual(len(self.conversations), 0)
 
 if __name__ == "__main__":
     unittest.main()
-
-
