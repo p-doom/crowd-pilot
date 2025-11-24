@@ -74,7 +74,7 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
     conversations_written = 0
 
     for i, (session_df, _) in enumerate(session_dataframes):
-        conversations = session_to_nemo_conversations(
+        conversations, per_conversation_tokens = session_to_nemo_conversations(
             session_df,
             cfg.max_tokens_per_conversation,
             max_tokens_per_message=cfg.max_tokens_per_message,
@@ -84,11 +84,6 @@ def to_nemo_jsonl(cfg: SerializeConfig) -> None:
 
         # Per-conversation statistics (for reporting)
         per_conversation_messages = [len(conversation) for conversation in conversations]
-        per_conversation_tokens = [
-            # FIXME (f.srambical): this is highly inefficient
-            sum(len(tokenizer.encode(turn.get("value", ""))) for turn in conversation)
-            for conversation in conversations
-        ]
         
         message_counts.extend(per_conversation_messages)
         token_counts.extend(per_conversation_tokens)
@@ -178,8 +173,6 @@ def parse_args() -> SerializeConfig:
                    help="Output directory for JSONL files")
     p.add_argument("--min_conversation_messages", type=int, default=5, 
                    help="Minimum number of messages to keep a conversation chunk")
-    p.add_argument("--max_conversations", type=int, default=None, 
-                   help="Stop after writing this many conversations")
     p.add_argument("--val_ratio", type=float, default=0.10, 
                    help="Fraction of sessions to route to validation [0,1)")
     p.add_argument(

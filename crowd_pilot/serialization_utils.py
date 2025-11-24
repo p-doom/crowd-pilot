@@ -35,6 +35,7 @@ class ConversationState:
     max_tokens_per_message: int
     min_conversation_messages: int
     tokenizer: Any
+    conversation_token_counts: List[int] = field(default_factory=list)
     current_conversation: List[Dict[str, str]] = field(default_factory=list)
     current_tokens: int = 0
     files_opened_in_conversation: set[str] = field(default_factory=set)
@@ -51,6 +52,7 @@ class ConversationState:
 
             if is_long_enough and has_user and has_assistant:
                 self.conversations.append(self.current_conversation)
+                self.conversation_token_counts.append(self.current_tokens)
         
         self.current_conversation = []
         self.current_tokens = 0
@@ -232,7 +234,7 @@ def session_to_nemo_conversations(
     viewport_radius: int = 10,
     normalize_terminal_output: bool = True,
     coalesce_radius: int = 5,
-) -> List[List[Dict[str, str]]]:
+) -> Tuple[List[List[Dict[str, str]]], List[int]]:
     """
     Convert a session DataFrame to one or more NeMo conversations.
 
@@ -246,8 +248,10 @@ def session_to_nemo_conversations(
     per_file_viewport: Dict[str, Optional[Tuple[int, int]]] = {}
 
     conversations: List[List[Dict[str, str]]] = []
+    conversation_token_counts: List[int] = []
     conversation_state = ConversationState(
         conversations=conversations,
+        conversation_token_counts=conversation_token_counts,
         max_tokens_per_conversation=max_tokens_per_conversation,
         max_tokens_per_message=max_tokens_per_message,
         min_conversation_messages=min_conversation_messages,
@@ -487,7 +491,7 @@ def session_to_nemo_conversations(
     _flush_all_pending_edits()
     _flush_terminal_output_buffer()
     conversation_state.finalize_conversation()
-    return conversations
+    return conversations, conversation_token_counts
 
 
 
