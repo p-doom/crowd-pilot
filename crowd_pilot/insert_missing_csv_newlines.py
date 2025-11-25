@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import concurrent.futures
 import os
 import re
 import shutil
@@ -18,12 +19,6 @@ DEFAULT_TIMESTAMP_PATTERNS: Sequence[str] = (
     # Word-boundary-like guards to avoid partial matches inside larger numbers
     r"(?<!\d)\d+,\d+(?!\d)",
 )
-
-
-@dataclass
-class HeuristicConfig:
-    timestamp_regexes: List[Pattern[str]]
-    max_splits_per_line: int = 8  # safety guard to avoid explosion
 
 
 def compile_timestamp_regexes(patterns: Sequence[str]) -> List[Pattern[str]]:
@@ -68,7 +63,7 @@ def _is_inside_quotes(line: str, idx: int) -> bool:
     return in_quotes
 
 
-def find_row_start_indices(line: str, cfg: HeuristicConfig) -> List[int]:
+def find_row_start_indices(line: str, timestamp_regexes: List[Pattern[str]]) -> List[int]:
     """Find indices where a new CSV row likely starts within a (possibly merged) line.
 
     Heuristic:
@@ -79,7 +74,7 @@ def find_row_start_indices(line: str, cfg: HeuristicConfig) -> List[int]:
     - It should be immediately followed by a comma (end of second numeric column)
     """
     indices: List[int] = []
-    for rx in cfg.timestamp_regexes:
+    for rx in timestamp_regexes:
         for m in rx.finditer(line):
             s, e = m.start(), m.end()
             if _is_inside_quotes(line, s):
@@ -98,8 +93,8 @@ def find_row_start_indices(line: str, cfg: HeuristicConfig) -> List[int]:
     return indices
 
 
-def needs_split(line: str, cfg: HeuristicConfig) -> bool:
-    starts = find_row_start_indices(line, cfg)
+def needs_split(line: str, timestamp_regexes: List[Pattern[str]]) -> bool:
+    starts = find_row_start_indices(line, timestamp_regexes)
     if len(starts) >= 2:
         return True
     if len(starts) == 1:
@@ -110,7 +105,7 @@ def needs_split(line: str, cfg: HeuristicConfig) -> bool:
     return False
 
 
-def split_line_on_timestamps(line: str, cfg: HeuristicConfig) -> List[str]:
+def split_line_on_timestamps(line: str, timestamp_regexes: List[Pattern[str]], max_splits_per_line: int) -> List[str]:
     """
     Split a line into multiple lines when multiple timestamp tokens are present.
 
@@ -120,7 +115,7 @@ def split_line_on_timestamps(line: str, cfg: HeuristicConfig) -> List[str]:
     - Keep delimiters and content from each start to right before the next timestamp.
     - Trim leading whitespace/separators between chunks.
     """
-    starts = find_row_start_indices(line, cfg)
+    starts = find_row_start_indices(line, timestamp_regexes)
     if len(starts) == 0:
         return [line]
 
@@ -149,8 +144,8 @@ def split_line_on_timestamps(line: str, cfg: HeuristicConfig) -> List[str]:
         if segment:
             chunks.append(segment)
 
-        if len(chunks) >= cfg.max_splits_per_line:
-            break
+        if len(chunks) >= max_splits_per_line:
+            raise ValueError(f"Suspicously many splits in line: {line}")
 
     return chunks if chunks else [line]
 
@@ -162,26 +157,19 @@ def iter_csv_files(root: Path) -> Iterator[Path]:
                 yield Path(base) / name
 
 
-def atomic_write_text(target: Path, content: str, make_backup: bool = False) -> None:
+def atomic_write_text(target: Path, content: str) -> None:
     tmp_dir = target.parent
     with tempfile.NamedTemporaryFile("w", delete=False, dir=tmp_dir) as tf:
         tmp_path = Path(tf.name)
         tf.write(content)
     try:
-        if make_backup and target.exists():
-            backup_path = target.with_suffix(target.suffix + ".bak")
-            shutil.copy2(target, backup_path)
         os.replace(tmp_path, target)
     except Exception:
-        # Try to remove temp file if replace failed
-        try:
-            tmp_path.unlink(missing_ok=True)  # type: ignore[call-arg]
-        except Exception:
-            pass
+        tmp_path.unlink(missing_ok=True)
         raise
 
 
-def process_file(path: Path, cfg: HeuristicConfig, dry_run: bool = False, backup: bool = False) -> Tuple[bool, int]:
+def process_file(path: Path, timestamp_regexes: List[Pattern[str]], max_splits_per_line: int, dry_run: bool = False) -> Tuple[bool, int]:
     changed = False
     changes_count = 0
     with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
@@ -189,8 +177,8 @@ def process_file(path: Path, cfg: HeuristicConfig, dry_run: bool = False, backup
 
     output_lines: List[str] = []
     for line in original_lines:
-        if needs_split(line, cfg):
-            parts = split_line_on_timestamps(line, cfg)
+        if needs_split(line, timestamp_regexes):
+            parts = split_line_on_timestamps(line, timestamp_regexes, max_splits_per_line)
             if len(parts) > 1:
                 changed = True
                 changes_count += len(parts) - 1
@@ -200,7 +188,7 @@ def process_file(path: Path, cfg: HeuristicConfig, dry_run: bool = False, backup
             output_lines.append(line)
 
     if changed and not dry_run:
-        atomic_write_text(path, "".join(output_lines), make_backup=backup)
+        atomic_write_text(path, "".join(output_lines))
 
     return changed, changes_count
 
@@ -211,24 +199,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--pattern", "-p", action="append", default=list(DEFAULT_TIMESTAMP_PATTERNS),
                    help="Regex for timestamps (can be repeated). Default: numeric 'digits,digits'.")
     p.add_argument("--dry-run", action="store_true", help="Do not modify files, just report changes")
-    p.add_argument("--backup", action="store_true", help="Write .bak alongside modified files")
-    p.add_argument("--max-splits", type=int, default=8, help="Safety: maximum chunks per merged line")
-    p.add_argument("--include", action="append", default=None,
-                   help="Only process CSVs whose path contains this substring (can repeat)")
-    p.add_argument("--exclude", action="append", default=None,
-                   help="Skip CSVs whose path contains this substring (can repeat)")
+    p.add_argument("--max-splits", type=int, default=5, help="Safety: maximum chunks per merged line")
+    p.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 1, help="Number of parallel jobs")
     return p.parse_args(argv)
-
-
-def should_process(path: Path, includes: Optional[Sequence[str]], excludes: Optional[Sequence[str]]) -> bool:
-    s = str(path)
-    if includes:
-        if not any(k in s for k in includes):
-            return False
-    if excludes:
-        if any(k in s for k in excludes):
-            return False
-    return True
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -239,22 +212,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     timestamp_regexes = compile_timestamp_regexes(args.pattern)
-    cfg = HeuristicConfig(timestamp_regexes=timestamp_regexes, max_splits_per_line=int(args.max_splits))
 
-    total_files = 0
+    all_files = list(iter_csv_files(root))
+    total_files = len(all_files)
     modified_files = 0
     total_inserts = 0
 
-    for csv_path in iter_csv_files(root):
-        if not should_process(csv_path, args.include, args.exclude):
-            continue
-        total_files += 1
-        changed, count = process_file(csv_path, cfg, dry_run=bool(args.dry_run), backup=bool(args.backup))
-        if changed:
-            modified_files += 1
-            total_inserts += count
-            action = "WOULD FIX" if args.dry_run else "FIXED"
-            print(f"{action}: {csv_path} (+{count} newline(s))")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as executor:
+        future_to_path = {
+            executor.submit(process_file, p, timestamp_regexes, args.max_splits, bool(args.dry_run)): p
+            for p in all_files
+        }
+
+        for future in concurrent.futures.as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                changed, count = future.result()
+                if changed:
+                    modified_files += 1
+                    total_inserts += count
+                    action = "WOULD FIX" if args.dry_run else "FIXED"
+                    print(f"{action}: {path} (+{count} newline(s))")
+            except Exception as exc:
+                print(f"Error processing {path}: {exc}", file=sys.stderr)
 
     print(f"Scanned {total_files} CSV file(s). Modified {modified_files}. Inserted {total_inserts} newline(s).")
     return 0
