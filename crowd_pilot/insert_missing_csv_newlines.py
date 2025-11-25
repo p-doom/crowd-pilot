@@ -145,7 +145,7 @@ def split_line_on_timestamps(line: str, timestamp_regexes: List[Pattern[str]], m
             chunks.append(segment)
 
         if len(chunks) >= max_splits_per_line:
-            raise ValueError(f"Suspicously many splits in line: {line}")
+            raise ValueError(f"Suspiciously many splits in line: {line}")
 
     return chunks if chunks else [line]
 
