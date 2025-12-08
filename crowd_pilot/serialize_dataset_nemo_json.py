@@ -20,10 +20,7 @@ from dataclasses import dataclass
 import pandas as pd
 from transformers import AutoTokenizer
 
-from serialization_utils import (
-    session_to_nemo_conversations,
-    _discover_local_sessions,
-)
+from serialization_utils import session_to_nemo_conversations
 
 @dataclass
 class SerializeConfig:
@@ -34,6 +31,16 @@ class SerializeConfig:
     csv_root: Optional[str]
     val_ratio: float
     tokenizer_model: str
+
+
+def _discover_local_sessions(root: Path) -> List[Path]:
+    # Recursively find all CSV files
+    paths: List[Path] = []
+    for p in root.rglob("*.csv"):
+        if p.is_file():
+            paths.append(p)
+    paths.sort()
+    return paths
 
 
 def to_nemo_jsonl(cfg: SerializeConfig) -> None:
