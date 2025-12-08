@@ -500,13 +500,3 @@ def load_hf_csv(hf_path: str, split: str) -> Dataset:
 
     assert isinstance(loaded, Dataset), "Expected a Dataset from load_dataset"
     return loaded
-
-
-def _discover_local_sessions(root: Path) -> List[Path]:
-    # Recursively find all CSV files
-    paths: List[Path] = []
-    for p in root.rglob("*.csv"):
-        if p.is_file():
-            paths.append(p)
-    paths.sort()
-    return paths
