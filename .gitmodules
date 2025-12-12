@@ -1,6 +1,0 @@
-[submodule "maxtext"]
-	path = maxtext
-	url = https://github.com/AI-Hypercomputer/maxtext
-[submodule "crowd-pilot-extension"]
-	path = crowd-pilot-extension
-	url = git@github.com:p-doom/crowd-pilot-extension.git
