@@ -1,6 +1,6 @@
 [project]
-name = "crowd-pilot"
-description = "Teaching language models to code like humans."
+name = "crowd-pilot-serializer"
+description = "CLI tool for serializing crowd-pilot's IDE interaction data"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,4 +15,4 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/p-doom/crowd-pilot"
+Repository = "https://github.com/p-doom/crowd-pilot-serializer-legacy"
