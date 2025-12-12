@@ -362,7 +362,7 @@ def session_to_nemo_conversations(
                     if not vp or vp[1] == 0:
                         vp = _compute_viewport(total_lines, 1, viewport_radius)
                         per_file_viewport[file_path] = vp
-                    if vp:
+                    if vp and vp[1] >= vp[0]:
                         vstart, vend = vp
                         conversation_state.maybe_capture_file_contents(file_path, content)
                         cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
@@ -431,7 +431,7 @@ def session_to_nemo_conversations(
                         vp = _compute_viewport(total_lines, target_line, viewport_radius)
                         per_file_viewport[file_path] = vp
                         should_emit = True
-                if should_emit and vp:
+                if should_emit and vp and vp[1] >= vp[0]:
                     vstart, vend = vp
                     conversation_state.maybe_capture_file_contents(file_path, content)
                     cmd = f"cat -n {file_path} | sed -n '{vstart},{vend}p'"
